@@ -1,4 +1,4 @@
-# awk-red v0.1.0
+# awk-red ![Version](https://img.shields.io/badge/version-v0.1.0-red)
 
 A Node-RED style event router built on MQTT, `mosquitto_sub` and AWK.
 
