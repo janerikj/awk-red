@@ -109,7 +109,8 @@ never committed.
 | `NTFY_TOPIC` | empty | target for `notify()` |
 | `AWKRED_ENV` | `./.env` if present | env file to load (`-e`) |
 
-**Precedence:** command line > environment > `.env` > built-in default.
+> [!NOTE]
+> **Precedence:** command line > environment > `.env` > built-in default.
 
 A password reaches the broker clients as a command-line argument, so it is
 visible in `ps` to other users on the machine. On a shared host, connect over
