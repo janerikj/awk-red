@@ -1,0 +1,25 @@
+[Unit]
+Description=awk-red MQTT event router
+Documentation=file:/usr/local/share/doc/awk-red/README.md
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/awk-red -q -e /etc/awk-red/.env -r /etc/awk-red/rules
+Restart=always
+RestartSec=5
+
+# the router needs nothing but a network socket
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/awk-red
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

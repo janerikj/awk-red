@@ -1,0 +1,12 @@
+home/kitchen/temp 21.4
+home/kitchen/temp 29.9
+home/door open
+home/kitchen/temp 31.2
+home/sensor/json {"temperature": 33.7, "humidity": 41}
+home/door closed
+home/attic/temp 18.0
+home/kitchen/temp 27.5
+home/garden/temp 33.9
+home/door open
+home/unknown/device no rule matches this topic
+home/attic/temp

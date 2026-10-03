@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# test/fake-mosquitto-sub - a stand-in for mosquitto_sub.
+#
+# awk-red talks to a fake subscriber rather than to a real broker so that the
+# failure paths can be produced on demand: a subscription that is refused, one
+# that dies, one that delivers nothing. None of the bugs that shaped the
+# supervision code were MQTT bugs, so there is nothing to gain from a real broker
+# here.
+#
+# The mode comes from the environment, not from argv: awk-red passes real
+# mosquitto_sub options, and a path with arguments in it is not a command that
+# stdbuf can run.
+#
+#   FAKE_SUB_MODE=accept           connect and stay silent for ever
+#   FAKE_SUB_MODE=deny             refuse the connection and exit 5
+#   FAKE_SUB_MODE=die              exit FAKE_SUB_CODE (default 1) straight away
+#   FAKE_SUB_MODE=stream           FAKE_SUB_COUNT messages, FAKE_SUB_GAP seconds
+#                                  apart, then silence
+#   FAKE_SUB_MODE=buffered         the same messages, printed by a gawk that
+#                                  blocks on a fifo instead of exiting, so each
+#                                  line only leaves the process because awk-red
+#                                  wraps the subscriber in stdbuf -oL
+#
+#   FAKE_SUB_COUNT    default 3
+#   FAKE_SUB_GAP      default 0.4 seconds
+#   FAKE_SUB_TOPIC    default home/kitchen/temp
+#   FAKE_SUB_PAYLOAD  default "message N"; set it to anything a rule reacts to
+#   FAKE_SUB_CODE     default 1
+#
+# Holding the connection open is done with one-second sleeps rather than one
+# long sleep: a killed child inherits the fifo descriptor, and a lingering
+# hour-long sleep would keep the fifo open after the reader is gone.
+
+set -u
+
+count=${FAKE_SUB_COUNT:-3}
+gap=${FAKE_SUB_GAP:-0.4}
+gate=
+gawk_pid=
+topic=${FAKE_SUB_TOPIC:-home/kitchen/temp}
+payload=${FAKE_SUB_PAYLOAD:-}
+code=${FAKE_SUB_CODE:-1}
+
+# Any process at all keeps the fifo open for the reader; sleep is the quietest.
+idle() { exec sleep 3600; }
+
+# Stay connected for a long time without leaving behind a child that could
+# outlive us and hold the fifo open.
+hold() {
+    local i
+    for (( i = 0; i < 3600; i++ )); do
+        sleep 1
+    done
+}
+
+case ${FAKE_SUB_MODE:-accept} in
+accept)
+    idle
+    ;;
+deny)
+    printf 'Connection error: Connection Refused: not authorised.\n' >&2
+    exit 5
+    ;;
+die)
+    printf 'fake-mosquitto-sub: dying on request\n' >&2
+    exit "$code"
+    ;;
+stream)
+    for (( i = 1; i <= count; i++ )); do
+        # The payload has to be something a rule reacts to: a temperature rule
+        # given "message 1" correctly does nothing, and a case that then counts
+        # published commands looks like a buffering failure when it is not.
+        printf '%s %s\n' "$topic" "${payload:-message $i}"
+        (( i < count )) && sleep "$gap"
+    done
+    hold
+    ;;
+buffered)
+    # The point of this mode: gawk flushes its output before it reads a record,
+    # so a program that prints and then blocks on *input* looks line buffered
+    # whether it is or not. Blocking on a getline from a fifo that nobody writes
+    # to is what actually exposes block buffering - the line only leaves the
+    # process because awk-red wrapped it in stdbuf -oL.
+    #
+    # Without stdbuf the reader sees nothing at all until this process exits.
+    gate="${TMPDIR:-/tmp}/fake-sub-gate.$$"
+    rm -f "$gate"
+    mkfifo "$gate" || exit 70
+    # The trap owns the gawk this script starts. A bash script that dies on
+    # SIGTERM leaves a foreground child behind, and a leftover reader keeps the
+    # gate open for ever - which is also how the ticker leaked its sleep.
+    trap 'kill "${gawk_pid:-}" 2>/dev/null; rm -f "$gate"; exit 0' TERM INT
+    gawk -v gate="$gate" -v n="$count" -v topic="$topic" -v payload="$payload" '
+        BEGIN {
+            for (i = 1; i <= n; i++)
+                printf "%s %s\n", topic, (payload == "" ? "message " i : payload)
+            while ((getline line < gate) > 0)
+                ;
+        }' &
+    gawk_pid=$!
+    wait "$gawk_pid"
+    rm -f "$gate"
+    hold
+    ;;
+*)
+    printf 'fake-mosquitto-sub: unknown mode %s\n' "${FAKE_SUB_MODE:-}" >&2
+    exit 64
+    ;;
+esac

@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# recordings and logs
+*.log
+!examples/messages.log
+
+# windows / editor droppings
+*:Zone.Identifier
+*.swp
+*~
+.DS_Store
