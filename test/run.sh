@@ -105,6 +105,26 @@ finish_awkred() {
     wait "$RUN_PID"
 }
 
+
+
+# simple HTTP client using /dev/tcp; returns 1 on failure
+http_get() {
+    local port=$1
+    local path=$2
+    local resp
+    local rc=1
+    if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
+        printf 'GET %s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n' "$path" >&3
+        resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
+        exec 3<&- 3>&-
+        if [[ $resp == *"200 OK"* ]]; then
+            rc=0
+        fi
+        printf '%s' "$resp" >"$WORK/httpresp"
+    fi
+    return $rc
+}
+
 # -------------------------------------------------------------------- cases
 
 case_replay_golden() {
@@ -276,6 +296,19 @@ case_validation() {
     "$AWKRED" -l >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 0 )) || bad "--list-rules gave exit $rc"
+    # http validation
+    "$AWKRED" --http-port abc >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "--http-port abc gave exit $rc"
+    "$AWKRED" --http-port 99999 >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "--http-port 99999 gave exit $rc"
+    "$AWKRED" -P 0 -l >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "-P 0 gave exit $rc"
+    "$AWKRED" -P 9 -i examples/messages.log >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "-P with -i gave exit $rc"
     pass "$CASE"
 }
 
@@ -290,6 +323,72 @@ case_help_and_version() {
     pass "$CASE"
 }
 
+
+case_http_off_by_default() {
+    CASE="http is off by default"
+    local banner
+    banner=$("$AWKRED" -n -q -i examples/messages.log 2>&1 >/dev/null)
+    [[ $banner != *"http"* ]] || bad "the banner mentions http without --http-port"
+    pass "$CASE"
+}
+
+case_http_routes() {
+    CASE="http requests become MQTT-style lines and rules route them"
+    local rc port
+    port=$((20000 + RANDOM % 10000))
+    start_awkred -n -v --http-port "$port" -r test/rules -h test.invalid
+    sleep 1.2
+    http_get "$port" "/hook/x?p=HOOKPAYLOAD"
+    rc=$?
+    finish_awkred TERM
+    (( rc == 0 )) || bad "http client did not get 200 OK"
+    grep -qF "DRYRUN> echo hook 'HOOKPAYLOAD'" "$OUT" || bad "hook echo not found, got: $(cat "$OUT")"
+    grep -qF 'route get/hook/x' "$ERR" || bad "route not logged, stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+case_http_port_taken() {
+    CASE="http port already in use fails fast"
+    local rc port
+    port=$((21000 + RANDOM % 10000))
+    # gawk binds lazily on the first getline, so this holds the port for as
+    # long as it blocks in accept(). Keeps the suite bash+coreutils+gawk only.
+    timeout 30 gawk -v PORT="$port" 'BEGIN { s = "/inet/tcp/" PORT "/0/0"; r = (s |& getline l) }' </dev/null &
+    local occup=$!
+    sleep 0.6
+    "$AWKRED" -n -q --http-port "$port" >/dev/null 2>"$ERR"
+    rc=$?
+    kill $occup 2>/dev/null; wait $occup 2>/dev/null
+    (( rc == 1 )) || bad "exit $rc (expected 1), stderr: $(cat "$ERR")"
+    grep -qF "http port $port is not available" "$ERR" || bad "stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+case_http_deny() {
+    CASE="http with refused subscription exits 5 without hang"
+    local rc port
+    port=$((22000 + RANDOM % 10000))
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --http-port "$port" -h test.invalid >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 5 )) || bad "exit $rc (124 means hung), stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+case_http_sigterm() {
+    CASE="http listener stops cleanly on SIGTERM"
+    local rc port
+    port=$((23000 + RANDOM % 10000))
+    start_awkred -n --http-port "$port" -h test.invalid
+    sleep 1.0
+    finish_awkred TERM
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
 case_list_rules() {
     CASE="every example rule is discovered"
     "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
@@ -316,6 +415,11 @@ cases=(
     case_validation
     case_help_and_version
     case_list_rules
+    case_http_off_by_default
+    case_http_routes
+    case_http_port_taken
+    case_http_deny
+    case_http_sigterm
 )
 
 printf 'awk-red test suite\n\n'

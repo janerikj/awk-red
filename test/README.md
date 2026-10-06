@@ -5,16 +5,17 @@
 ./test/run.sh buffering    # only cases whose name contains "buffering"
 ```
 
-No broker, no network, no dependencies beyond bash and coreutils. A run ends
-with `N passed, 0 failed`, or with `N passed, M failed` and the failing case
-named.
+No broker, no network, no dependencies beyond bash, coreutils and gawk - the
+project's own. A run ends with `N passed, 0 failed`, or with `N passed, M
+failed` and the failing case named.
 
 ## What is here
 
 | File | Purpose |
 | --- | --- |
-| `run.sh` | the suite: replay, clock, failure paths, signals, buffering |
+| `run.sh` | the suite: replay, clock, failure paths, signals, buffering, HTTP |
 | `fake-mosquitto-sub` | a stand-in subscriber whose behaviour comes from the environment |
+| `rules/webhook.awk` | the rule the HTTP cases route through |
 | `expected/messages.log.out` | golden output for the replay case |
 
 `awk-red` reads `MOSQ_SUB` from the environment, which is what lets the suite
@@ -52,6 +53,31 @@ The fake keeps its connection open with one-second sleeps rather than one long
 sleep, and kills its own children from a trap: a killed child inherits the fifo
 descriptor, and a lingering sleep would keep the fifo open after the reader is
 gone.
+
+## HTTP
+
+Five cases, all offline: `http is off by default`, `http requests become
+MQTT-style lines and rules route them`, `http port already in use fails fast`,
+`http with refused subscription exits 5 without hang` and `http listener stops
+cleanly on SIGTERM`.
+
+They are written the same way as the rest of the suite - no HTTP library, no
+python:
+
+* **`http_get`** is a bash function over `/dev/tcp`: open, `printf` a request,
+  `head -c` the reply. It only reports success on `200 OK`, and it never runs
+  two requests at once, because gawk's listener closes its listening socket
+  while it is handling one.
+* **Taking a port** starts a gawk that holds it. gawk's bind is lazy - opening
+  `/inet/tcp/PORT/0/0` does nothing until the first `getline` - so a bare
+  `BEGIN` that does that `getline` binds, listens and then blocks in `accept()`,
+  which is exactly the hold we want. The same asymmetry drives the preflight in
+  `awk-red`: on a taken port `getline` returns immediately with
+  `ERRNO = "Address already in use"`, on a free one it blocks, and `timeout`
+  tells them apart.
+* **No hangs.** Every case that starts a run goes through `timeout`, so a
+  listener that outlives its subscription is reported as exit 124 instead of
+  stalling the suite.
 
 ## Leftovers are a failure
 

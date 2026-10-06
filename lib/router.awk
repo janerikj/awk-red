@@ -77,13 +77,6 @@ function pub_retained(topic, payload) {
     return emit(PUB_CMD " -r -t " shquote(topic) " -m " shquote(payload))
 }
 
-# Send a push notification via ntfy, if NTFY_TOPIC is configured.
-#     notify("Door opened")
-function notify(msg) {
-    if (NTFY_TOPIC == "")
-        return warn("notify() called but NTFY_TOPIC is not configured")
-    return emit("ntfy publish " shquote(NTFY_TOPIC) " " shquote(msg))
-}
 
 # ----------------------------------------------------------------- dispatch
 
@@ -214,7 +207,6 @@ BEGIN {
     MQTT_PASS = getenv("MQTT_PASS", "")
     MQTT_TLS = envbool("MQTT_TLS", "0")
     MQTT_CAFILE = getenv("MQTT_CAFILE", "")
-    NTFY_TOPIC = getenv("NTFY_TOPIC", "")
 
     PUB_CMD = build_pub_cmd()
     MSGS = 0

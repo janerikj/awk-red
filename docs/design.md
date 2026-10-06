@@ -124,8 +124,8 @@ function temp_handler(topic, payload) {
 
 ## Side effects belong to the engine
 
-Rules never call `system()` or `mosquitto_pub` directly. They call `emit()`,
-`pub()` or `notify()`, and the engine decides what that means. Three things
+Rules never call `system()` or `mosquitto_pub` directly. They call `emit()` or
+`pub()`, and the engine decides what that means. Three things
 fall out of that:
 
 * **`--dry-run` covers everything.** One switch prints every command instead
@@ -241,6 +241,7 @@ process:
 write_loop (background subshell, owns the fifo)
   |- mosquitto_sub     the subscription
   |- tick_loop         the clock, when --tick is on
+  |- http_loop         the HTTP listener, when --http-port is on
 
 gawk -f lib/router.awk ... < "$fifo"          the engine
 ```
@@ -281,6 +282,43 @@ One writer process makes all three questions unnecessary, and `wait -n` would
 not have helped either: it reports that a child finished but swallows which one
 and what it returned. Polling also cost up to half a second of shutdown latency;
 with the writer, a dead subscription ends the run in roughly 30 ms.
+
+## HTTP on the same fifo
+
+`--http-port` puts a third writer in `write_loop`. It had to live there: the
+run ends with the subscription, and if the listener kept the fifo open after
+that, the engine would never see end of input and awk-red would hang on its
+final `wait`. So `http_loop` is started only when the port is on, added to the
+`TERM`/`INT` trap alongside the other children, and `stop_child`-ed the moment
+the subscription's `wait` returns.
+
+Everything else about it is gawk's `/inet/tcp`, which is not a web server:
+
+* **The bind is lazy.** Opening `/inet/tcp/PORT/0/0` does nothing; the real
+  `socket`/`bind`/`listen` happen on the first `getline`. A taken port is
+  therefore reported as `ERRNO = "Address already in use"` from `getline`, not
+  from the open, and it fails immediately while a free one blocks in `accept()`.
+  That asymmetry is what the preflight relies on: run the same probe under
+  `timeout`, and "exited 1" means the port is taken while "still running when
+  timeout killed it" means it was free. No second dependency, and no bind test
+  that only ever checks loopback. gawk's own bind failure at run time is fatal
+  for the same reason - without it, a failed `close`/reopen would spin.
+* **`listen(fd, 1)` and one connection at a time.** gawk closes the listening
+  socket as soon as it has accepted, and reopens it only after the response is
+  written and the connection closed. Anything that arrives while a request is
+  in flight gets an RST from the kernel: `ECONNREFUSED`, not a queue. The
+  practical contract is therefore "one request at a time, retry on refusal",
+  which is written down rather than papered over, because no amount of code
+  here changes what gawk does with the fd.
+* **`PROCINFO[service, "READ_TIMEOUT"]` only covers the read.** It drops a
+  client that connects and never finishes a request line after 1.5 s - the
+  listener comes back - but there is no timeout on `accept()`, so an idle port
+  simply blocks, which is exactly what we want.
+
+The preflight has a deliberate gap: it proves the port was free a moment
+before the run starts, and someone could take it in between. The fatal bind
+message in `lib/http.awk` covers that window, so the worst case is a run that
+says why it has no listener, not one that silently never listens.
 
 ## Signals
 

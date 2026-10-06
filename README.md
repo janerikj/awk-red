@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.1.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.2.0-red)
 
 A Node-RED style event router built on MQTT, `mosquitto_sub` and AWK.
 
@@ -18,13 +18,14 @@ that handles what AWK is bad at, and a small AWK engine that routes.
 ```
 mosquitto_sub -v -t '#'
         |
-        |  line buffered (stdbuf -oL)
-        v
+        |  line buffered (stdbuf -oL)          HTTP clients (--http-port)
+        |                                       |  one request per connection
+        +-------------------+-------------------+
+                            v
 gawk -f lib/router.awk -f <rules>/*.awk     the engine
         |
         +--> pub()    -> mosquitto_pub    (new MQTT messages)
         +--> emit()   -> any command      (logger, ntfy, curl, scripts)
-        +--> notify() -> ntfy
 ```
 
 The engine never changes when automations are added. A rule is a new file in
@@ -37,9 +38,9 @@ a rule directory, and nothing else.
 | `bash` >= 4.4 | the entry point | ships everywhere |
 | `gawk` >= 4.0 | indirect calls, two-way coprocesses | `sudo apt install gawk` |
 | `mosquitto_sub` | the MQTT subscription | `sudo apt install mosquitto-clients` |
-| `stdbuf` | line buffering (coreutils) | usually already installed |
+| `stdbuf`, `timeout` | line buffering and the HTTP preflight (coreutils) | usually already installed |
 | `jq` | only for JSON payload adapters | `sudo apt install jq` |
-| `ntfy` | only if a rule calls `notify()` | <https://github.com/dschep/ntfy> |
+| `ntfy` | only if a rule emits ntfy notifications | <https://github.com/dschep/ntfy> |
 
 `mawk` is the default `awk` on Raspberry Pi OS and is **not** supported: awk-red
 calls `gawk` explicitly.
@@ -106,7 +107,7 @@ never committed.
 | `AWKRED_FIRST_MATCH` | `0` | stop after the first matching rule |
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
 | `AWKRED_TICK` | `0` | clock interval in seconds, `0` is off (`--tick`) |
-| `NTFY_TOPIC` | empty | target for `notify()` |
+| `AWKRED_HTTP_PORT` | `0` | listen for HTTP webhooks on this port, `0` is off (`--http-port`) |
 | `AWKRED_ENV` | `./.env` if present | env file to load (`-e`) |
 
 > [!NOTE]
@@ -129,6 +130,8 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of MQTT
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
+-P, --http-port [PORT]  serve HTTP webhooks on PORT (default 8080 if given
+                    without a value; off unless set)
 -n, --dry-run       print commands instead of running them
 -l, --list-rules    list the loaded rules and exit
 -v, --verbose       log routing decisions to stderr
@@ -177,7 +180,6 @@ minute" or "only on a state change".
 | `adapter(pattern, jq_filter)` | normalise a JSON payload before rules see it |
 | `pub(topic, payload)` | publish an MQTT message, using the configured broker |
 | `pub_retained(topic, payload)` | the same, with the retained flag |
-| `notify(message)` | send an ntfy push notification |
 | `emit(command)` | run any command, subject to `--dry-run` |
 | `shquote(string)` | quote a value for use in `emit()` |
 | `debug(msg)` | log when `--verbose` is set |
@@ -200,7 +202,11 @@ that is not MQTT, build it with `shquote()` so values with spaces stay one
 argument:
 
 ```awk
-emit("curl -fsS " shquote("https://example.org/hook?msg=" url) )
+# send a notification via ntfy (topic can vary per rule)
+emit("ntfy publish alerts " shquote("Door opened"))
+
+# or trigger a webhook
+emit("curl -fsS " shquote("https://example.org/hook?msg=" url))
 ```
 
 ## Payload formats
@@ -228,6 +234,46 @@ An adapter must yield exactly one line per message. Extra lines are dropped;
 a filter that yields nothing will desync that adapter, so keep it to a single
 value. If a topic carries deeply nested JSON with varying schemas, parse it in
 AWK instead - see `docs/design.md`.
+
+## HTTP webhooks
+
+Rules can be driven over plain HTTP as well as MQTT. It is off unless asked
+for: `--http-port PORT` or `AWKRED_HTTP_PORT`, where `-P` on its own means
+8080. The listener binds all interfaces (there is no host option), so treat it
+like any other port you expose and firewall it accordingly.
+
+A request becomes one line of engine input, exactly as a broker would deliver
+it:
+
+```text
+POST /door/front?p=open        ->  post/door/front open
+GET  /temp?p=21.5%20C          ->  get/temp 21.5 C
+POST /sensor   {"t":21}        ->  post/sensor {"t":21}
+```
+
+* The topic is the lowercased method plus the path with leading slashes
+  stripped, so `/Door/Front` and `GET` give `get/door/front`.
+* The payload is `p=` or `payload=` from the query string, urldecoded. If
+  neither is present, the request body is used as a single line; a multi-line
+  body is truncated at the first line.
+* Every other query parameter is ignored.
+* One request per connection. It is answered `200 OK` or `400 Bad Request` and
+  the connection is closed.
+
+awk-red checks the port before it starts anything, so a webhook port that is
+already taken fails immediately with a clear message rather than starting a
+run that can never answer.
+
+```awk
+# rules/webhook.awk
+BEGIN { reg("^get/hook/", "hook_handler", "manual trigger") }
+function hook_handler(topic, payload) { emit("echo got " shquote(payload)) }
+```
+
+gawk's `/inet/tcp` is not a web server: it accepts one connection at a time
+and closes the listening socket while the request is being handled, so a
+connection arriving in that window is refused by the kernel. Send webhooks one
+at a time and retry on `Connection refused`; see *Limitations*.
 
 ## Buffering between stages
 
@@ -400,6 +446,10 @@ does, the alternatives that were rejected, and what is worth building next.
   handler stalls every other rule. Scheduled work comes from `--tick` instead.
 * A tick is one message per interval, not a general timer wheel: there is one
   interval, and it is the same for every rule.
+* HTTP webhooks are served one connection at a time. gawk closes the listening
+  socket while it handles a request, so concurrent requests get `Connection
+  refused` - retry, or space them out. A client that connects and never sends a
+  request is dropped after 1.5 s.
 * This is not Node-RED. It is comfortable up to roughly a hundred
   automations, not for flows with hundreds of branches.
 
