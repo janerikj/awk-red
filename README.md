@@ -1,4 +1,7 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.2.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.2.1-red)
+
+> [!WARNING]
+> v0: The interface is subject to change!
 
 A Node-RED style event router built on MQTT, `mosquitto_sub` and AWK.
 
@@ -248,14 +251,17 @@ it:
 ```text
 POST /door/front?p=open        ->  post/door/front open
 GET  /temp?p=21.5%20C          ->  get/temp 21.5 C
+GET  /hook?msg=hello           ->  get/hook hello
+GET  /Door/Front               ->  get/Door/Front
 POST /sensor   {"t":21}        ->  post/sensor {"t":21}
 ```
 
-* The topic is the lowercased method plus the path with leading slashes
-  stripped, so `/Door/Front` and `GET` give `get/door/front`.
-* The payload is `p=` or `payload=` from the query string, urldecoded. If
-  neither is present, the request body is used as a single line; a multi-line
-  body is truncated at the first line.
+* The topic is the lowercased HTTP method plus the path with leading slashes
+  stripped. Only the method is lowercased; the path is kept exactly as sent, so
+  `GET /Door/Front` gives `get/Door/Front`.
+* The payload is the first of `p=`, `payload=` or `msg=` present in the query
+  string, urldecoded. If none is present, the request body is used as a single
+  line; a multi-line body is truncated at the first line.
 * Every other query parameter is ignored.
 * One request per connection. It is answered `200 OK` or `400 Bad Request` and
   the connection is closed.
@@ -274,6 +280,34 @@ gawk's `/inet/tcp` is not a web server: it accepts one connection at a time
 and closes the listening socket while the request is being handled, so a
 connection arriving in that window is refused by the kernel. Send webhooks one
 at a time and retry on `Connection refused`; see *Limitations*.
+
+### Choosing the topic your rule publishes to
+
+The `topic` argument a handler receives is the *input* topic, not something you
+have to publish under. `pub()` takes any topic, so reshaping or replacing it is
+an ordinary string operation. To drop the method prefix:
+
+```awk
+# rules/webhook-mqtt.awk
+BEGIN {
+    reg("^post/hook/", "hook_forward", "republish webhooks under our own topic")
+}
+
+function hook_forward(topic, payload,    t) {
+    t = topic
+    sub(/^[a-z]+\//, "", t)     # post/hook/front -> hook/front
+    pub("events/" t, payload)   # publishes events/hook/front
+}
+```
+
+`POST /hook/front?p=open` arrives as `post/hook/front` with payload `open` and
+the rule publishes `events/hook/front` = `open`. To ignore the path entirely,
+build the topic from the payload or a constant instead: `pub("home/kitchen",
+payload)`.
+
+Only `p=`, `payload=` and `msg=` reach the rule, so a request cannot yet name
+its own topic; a `topic=` override is noted in `docs/design.md` as a possible
+future extension.
 
 ## Buffering between stages
 

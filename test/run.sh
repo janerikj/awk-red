@@ -107,21 +107,28 @@ finish_awkred() {
 
 
 
-# simple HTTP client using /dev/tcp; returns 1 on failure
+# Simple HTTP client using /dev/tcp; returns 1 on failure. gawk's listener
+# refuses a connection while it is handling the previous one, so the client
+# retries a few times - the same "retry on Connection refused" the README
+# documents for real senders.
 http_get() {
     local port=$1
     local path=$2
-    local resp
-    local rc=1
-    if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
-        printf 'GET %s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n' "$path" >&3
-        resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
-        exec 3<&- 3>&-
-        if [[ $resp == *"200 OK"* ]]; then
-            rc=0
+    local resp rc=1 attempt
+    for attempt in 1 2 3 4; do
+        resp=""
+        if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
+            printf 'GET %s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n' "$path" >&3
+            resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
+            exec 3<&- 3>&-
+            printf '%s' "$resp" >"$WORK/httpresp"
+            if [[ $resp == *"200 OK"* ]]; then
+                rc=0
+                break
+            fi
         fi
-        printf '%s' "$resp" >"$WORK/httpresp"
-    fi
+        sleep 0.2
+    done
     return $rc
 }
 
@@ -334,15 +341,24 @@ case_http_off_by_default() {
 
 case_http_routes() {
     CASE="http requests become MQTT-style lines and rules route them"
-    local rc port
+    local rc rc_msg rc_prec port
     port=$((20000 + RANDOM % 10000))
     start_awkred -n -v --http-port "$port" -r test/rules -h test.invalid
     sleep 1.2
     http_get "$port" "/hook/x?p=HOOKPAYLOAD"
     rc=$?
+    http_get "$port" "/hook/m?msg=MSGVAL"
+    rc_msg=$?
+    http_get "$port" "/hook/prec?p=FIRST&msg=SECOND"
+    rc_prec=$?
     finish_awkred TERM
-    (( rc == 0 )) || bad "http client did not get 200 OK"
+    (( rc == 0 )) || bad "http client did not get 200 OK (p=)"
+    (( rc_msg == 0 )) || bad "http client did not get 200 OK (msg=)"
+    (( rc_prec == 0 )) || bad "http client did not get 200 OK (precedence)"
     grep -qF "DRYRUN> echo hook 'HOOKPAYLOAD'" "$OUT" || bad "hook echo not found, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo hook 'MSGVAL'" "$OUT" || bad "msg= payload not routed, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo hook 'FIRST'" "$OUT" || bad "p= should win over msg=, got: $(cat "$OUT")"
+    grep -qF "hook 'SECOND'" "$OUT" && bad "msg= payload used despite p= being present"
     grep -qF 'route get/hook/x' "$ERR" || bad "route not logged, stderr: $(cat "$ERR")"
     assert_no_strays
     pass "$CASE"

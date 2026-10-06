@@ -6,20 +6,21 @@
 #
 # Contract (minimal, as agreed):
 # - Topic: lowercase(method)/<path> where <path> has leading slashes removed
-# - Payload: use `p=` or `payload=` from the query if present; if not present,
-#   use the request body as a single line (multi-line bodies are truncated to
-#   the first line read: the implementation reads at most one line of body).
-#   Payload strings are urldecoded for `p=`/`payload=`.
-# - Only `p=` and `payload=` query keys are honoured. Other query parameters are
-#   ignored.
+# - Payload: the first of `p=`, `payload=` or `msg=` present in the query
+#   string, urldecoded. If none is present, the request body is used as a
+#   single line; a multi-line body is truncated at the first line read.
+# - Only `p=`, `payload=` and `msg=` query keys are honoured. Other query
+#   parameters are ignored. The key set is deliberately small: an alias is
+#   added when a real sender hardcodes it, not speculatively.
 # - Invalid percent-encodings are skipped / passed through as-is by this minimal
 #   decoder.
 #
 # Examples:
 #   POST /door/front?p=open  ->  post/door/front open
 #   GET  /temp?p=21.5%20C    ->  get/temp 21.5 C
+#   GET  /hook?msg=hello     ->  get/hook hello
 #   POST /sensor {"t":21}    ->  post/sensor {"t":21}
-#   DELETE /nopay           ->  delete/nopay (empty payload)
+#   DELETE /nopay            ->  delete/nopay (empty payload)
 #
 # Limitations (gawk's /inet/tcp is not a real web server):
 # - One connection at a time. gawk closes the listening socket right after
@@ -116,11 +117,15 @@ BEGIN {
             }
         }
 
+        # Recognised payload keys, first match wins (p, then payload, then msg).
+        # Kept deliberately small; form-encoded bodies are not decoded.
         payload = ""
         if (query != "") {
             if (match(query, /(^|&)p=([^&]*)/, m)) {
                 payload = urldecode(m[2])
             } else if (match(query, /(^|&)payload=([^&]*)/, m)) {
+                payload = urldecode(m[2])
+            } else if (match(query, /(^|&)msg=([^&]*)/, m)) {
                 payload = urldecode(m[2])
             }
         }

@@ -65,9 +65,10 @@ They are written the same way as the rest of the suite - no HTTP library, no
 python:
 
 * **`http_get`** is a bash function over `/dev/tcp`: open, `printf` a request,
-  `head -c` the reply. It only reports success on `200 OK`, and it never runs
-  two requests at once, because gawk's listener closes its listening socket
-  while it is handling one.
+  `head -c` the reply, retrying a few times on refusal. It only reports success
+  on `200 OK`, and it never runs two requests at once, because gawk's listener
+  closes its listening socket while it is handling one - the retry is the same
+  "retry on `Connection refused`" the README asks of real senders.
 * **Taking a port** starts a gawk that holds it. gawk's bind is lazy - opening
   `/inet/tcp/PORT/0/0` does nothing until the first `getline` - so a bare
   `BEGIN` that does that `getline` binds, listens and then blocks in `accept()`,

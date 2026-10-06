@@ -320,6 +320,19 @@ before the run starts, and someone could take it in between. The fatal bind
 message in `lib/http.awk` covers that window, so the worst case is a run that
 says why it has no listener, not one that silently never listens.
 
+One limit is worth naming because its obvious fix is not in the code. The
+request cannot choose the topic it becomes: the topic is always `method/path`,
+and of the query string only `p=`, `payload=` and `msg=` survive - every other
+key is dropped before a rule ever sees it. The payload aliases are held to that
+short list on purpose, one added only when a real sender hardcodes it, so the
+contract stays small enough to hold in your head. Reshaping the topic itself is
+left to the rule, with `sub()`, which is why there is no helper for it. If a
+webhook source should publish under a name of its own, the natural extension is
+a reserved `topic=` key the listener uses verbatim, keeping the derivation as
+the default. It is not built because no source has needed it yet and because it
+widens the contract further - once a request can name its own topic, `reg()`
+patterns have to assume topics that do not come from a URL.
+
 ## Signals
 
 Children of a non-interactive shell inherit `SIGINT` and `SIGQUIT` as
@@ -483,10 +496,56 @@ cannot be confused. It is not built, because nothing outside needs it yet.
 Note that the `%` in a crontab line is a newline to cron, which is an argument
 for a systemd timer over cron regardless.
 
+## Webhook-only mode (planned)
+
+`--input` already gives a broker-free mode, but only for a recording. There is
+no *live* broker-free mode: `--http-port` still starts a subscription, and the
+run still ends when that subscription does. Making the subscriber optional
+would close the missing quadrant - a router driven only by webhooks or only by
+the clock - and it is a small change to the flags but a real change to the
+lifetime model, which is why it is written down here before being built.
+
+The lifetime is the whole problem. `write_loop` treats the clock and the HTTP
+listener as auxiliaries and waits on `mosquitto_sub`; when that returns it
+stops the auxiliaries, the fifo reaches EOF and the engine exits. With no
+subscription there is no terminator, so the roles invert and the remaining
+input sources become primary.
+
+Decisions already made:
+
+* **Signal-only lifetime.** With the subscription gone the run ends on
+  `SIGTERM`/`SIGINT`, not when an input goes quiet.
+* **A dead input is fatal.** `http_loop` currently swallows the listener's exit
+  status (`wait "$sleeper" || true`), so a crashed or wedged listener would
+  look like a healthy run. It has to propagate that status and `write_loop` has
+  to return it, so systemd restarts the service. The reporter needs to name the
+  source too: "mosquitto_sub exited with status N" is wrong when the HTTP
+  listener was the one that died.
+* **No broker tooling required.** `mosquitto_sub` is required only when MQTT is
+  on, mirroring the existing `--input` exemption, and the `mosquitto_pub`
+  warning is suppressed when MQTT is off. `pub()` still works if
+  `mosquitto_pub` happens to be installed.
+
+Still open: how the mode is selected. The trade-off is the default.
+
+| Option | Effect |
+| --- | --- |
+| `--no-mqtt` / `AWKRED_MQTT=0` | Non-breaking: MQTT stays on by default. Orthogonal to inputs, so a tick-only scheduler falls out for free. |
+| `--mqtt` / `AWKRED_MQTT=1`, defaulting off | Matches "turn MQTT on explicitly", but flips the default for every existing deployment and needs a migration note. |
+| `--input`-style selector over `mqtt`, `http`, `tick` | Clearest mental model - a run has a set of input sources - at the cost of the largest surface. |
+
+All three share the same validation: MQTT off requires at least one of
+`--tick` and `--http-port`, otherwise there is nothing to do and it is a usage
+error. The run-lifetime and reporting changes above are the same in each.
+
 ## Roadmap
 
 Roughly in order of value per effort:
 
+* **Webhook-only mode.** Make the subscription optional so HTTP and the clock
+  can be the only input sources; see *Webhook-only mode (planned)* above.
+* **A `topic=` override for webhooks.** Let a request name the engine topic
+  instead of deriving it from the method and path; see *HTTP on the same fifo*.
 * **Rate limiting / debounce** with `systime()`: at most one alarm per sensor
   per interval, independent of the state logic each rule writes today.
 * **State persistence**: dump selected variables on `END`, reload in `BEGIN`,
