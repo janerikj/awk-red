@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.2.1-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.3.0-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -18,13 +18,18 @@ filters, the action body transforms and decides, and `system()` calls out to
 other programs. awk-red is that idea implemented as two files - a shell script
 that handles what AWK is bad at, and a small AWK engine that routes.
 
+Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
+a broker, `--http-port` serves HTTP webhooks, `--tick` adds a clock, `-i`
+replays a recording. A run needs at least one of them; broker settings (`-h`,
+`MQTT_HOST`, ...) only configure connections and never switch an input on by
+themselves.
+
 ```
-mosquitto_sub -v -t '#'
-        |
-        |  line buffered (stdbuf -oL)          HTTP clients (--http-port)
-        |                                       |  one request per connection
-        +-------------------+-------------------+
-                            v
+mosquitto_sub -v -t '#'          HTTP clients              clock (--tick)
+        |                        |  one request per         |
+        |  line buffered         |  connection              |
+        +------------------------+--------------------------+
+                                 v
 gawk -f lib/router.awk -f <rules>/*.awk     the engine
         |
         +--> pub()    -> mosquitto_pub    (new MQTT messages)
@@ -40,7 +45,7 @@ a rule directory, and nothing else.
 | --- | --- | --- |
 | `bash` >= 4.4 | the entry point | ships everywhere |
 | `gawk` >= 4.0 | indirect calls, two-way coprocesses | `sudo apt install gawk` |
-| `mosquitto_sub` | the MQTT subscription | `sudo apt install mosquitto-clients` |
+| `mosquitto_sub` | the MQTT subscription, only with `--mqtt` | `sudo apt install mosquitto-clients` |
 | `stdbuf`, `timeout` | line buffering and the HTTP preflight (coreutils) | usually already installed |
 | `jq` | only for JSON payload adapters | `sudo apt install jq` |
 | `ntfy` | only if a rule emits ntfy notifications | <https://github.com/dschep/ntfy> |
@@ -55,14 +60,15 @@ git clone <this repo> && cd awk-red
 cp .env.example .env                     # set MQTT_HOST at least
 ./awk-red -n -i examples/messages.log    # dry run against a recording
 ./awk-red -l                             # what handles what
-./awk-red -r ./rules -h mqtt.local       # live, with your own rules
+./awk-red -n --tick 1                    # the clock alone, no broker needed
+./awk-red -r ./rules --mqtt -h mqtt.local # live, with your own rules
 ```
 
 Try it against a real broker without writing a single rule:
 
 ```shell
 # terminal 1
-./awk-red -n -v
+./awk-red -n -v --mqtt
 # terminal 2
 mosquitto_pub -t home/kitchen/temp -m 33.5      # -> DRYRUN> ... alarm/temp/kitchen
 mosquitto_pub -t home/door -m open
@@ -98,6 +104,7 @@ never committed.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `AWKRED_MQTT` | `0` | `1` subscribes to the broker (`--mqtt`) |
 | `MQTT_HOST` | `localhost` | broker hostname (`-h`) |
 | `MQTT_PORT` | `1883` | broker port (`-p`) |
 | `MQTT_USER` / `MQTT_PASS` | empty | broker credentials, sent as `-u`/`-P` |
@@ -116,6 +123,10 @@ never committed.
 > [!NOTE]
 > **Precedence:** command line > environment > `.env` > built-in default.
 
+The `MQTT_*` variables configure the broker connection for `--mqtt` and for
+`pub()` in every mode, but setting them never switches the subscription on:
+that is `--mqtt` or `AWKRED_MQTT=1`. A run without any input is a usage error.
+
 A password reaches the broker clients as a command-line argument, so it is
 visible in `ps` to other users on the machine. On a shared host, connect over
 TLS or give the broker a dedicated user for this service. Keep `.env` at mode
@@ -132,6 +143,7 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -r, --rules DIR     rule directory, *.awk loaded in sorted order
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of MQTT
+    --mqtt          subscribe to the broker (-h/-p above configure it)
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
 -P, --http-port [PORT]  serve HTTP webhooks on PORT (default 8080 if given
                     without a value; off unless set)
@@ -144,7 +156,13 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
     --version       show version
 ```
 
-Exit codes: `0` success, `1` dependency or runtime error, `2` usage error.
+At least one input is required: `--mqtt`, `--http-port`, `--tick` or `-i`.
+`-i` is exclusive with every live input - a recording is already a complete
+stream, so `--mqtt`, `--http-port` and `--tick` are rejected when it is given.
+
+Exit codes: `0` success, `1` dependency or runtime error, `2` usage error. A
+live input that fails for real carries its own status - `5` on a refused login -
+so systemd can restart the run; a stop signal (`130`/`143`) exits `0`.
 
 Short options take their value as a separate argument (`-i file`), long options
 also accept `--name=value`.
@@ -242,8 +260,11 @@ AWK instead - see `docs/design.md`.
 
 Rules can be driven over plain HTTP as well as MQTT. It is off unless asked
 for: `--http-port PORT` or `AWKRED_HTTP_PORT`, where `-P` on its own means
-8080. The listener binds all interfaces (there is no host option), so treat it
-like any other port you expose and firewall it accordingly.
+8080. HTTP can be the whole input: `./awk-red -n --http-port 8080` needs no
+broker subscription at all (`pub()` in a rule still uses the configured broker
+for what it sends). The listener binds all interfaces (there is no host
+option), so treat it like any other port you expose and firewall it
+accordingly.
 
 A request becomes one line of engine input, exactly as a broker would deliver
 it:
@@ -382,13 +403,15 @@ The clock lives in the shell, not in AWK. gawk has no timers and no
 concurrency: nothing inside the router can fire while input is idle, and a
 handler that waits blocks every other message behind it.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
-* the tick is a third writer on the fifo, so gawk no longer sees EOF when
-  `mosquitto_sub` disconnects. The run therefore ends when either stage stops,
-  and a subscription that fails on its own exits with its status, so systemd
-  restarts the service instead of leaving a router that is subscribed to
-  nothing
+* `--tick` is a complete run on its own - `./awk-red --tick 300 -r ~/rules`
+  needs no broker, no `mosquitto_sub` and no port
+* the tick is an extra writer on the fifo, so with `--mqtt` the engine no
+  longer sees EOF when the subscription disconnects. The run therefore ends
+  when either stage stops, and a source that fails on its own - a refused
+  login, a listener that crashed - exits with its status so systemd restarts
+  the service instead of leaving a router fed by nothing
 * never publish to `^awk-red/tick/` from a rule. With the default subscription
   the router receives its own messages back, so such a rule re-triggers itself
   once per interval, forever. Publishing elsewhere, as `heartbeat.awk` does,
@@ -415,6 +438,8 @@ echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
 * keep `-v` out of it and use `-q`, so the journal holds errors instead of one
   line per message
 * `Type=simple`, since the script runs in the foreground
+* `--mqtt` (or `AWKRED_MQTT=1` in the unit's environment) when the rules
+  should react to broker traffic - without it there is no subscription at all
 * `--tick` only if the rules need it, so `AWKRED_TICK=0` stays the default and
   an installation with no scheduled work behaves exactly like the examples
 
@@ -432,11 +457,15 @@ with `-e /etc/awk-red/.env`. Do not commit it.
 
 ## Troubleshooting
 
+**It exits immediately with `no input source`.** Nothing subscribes by
+default: add `--mqtt`, `--http-port`, `--tick` or `-i`. `-h`/`MQTT_HOST` only
+configure where a subscription would connect, they do not create one.
+
 **No output at all.** Check the subscription and the rules:
 
 ```shell
 ./awk-red -l                      # are any rules loaded?
-./awk-red -v -t 'home/#'          # does anything match the topic filter?
+./awk-red -v --mqtt -t 'home/#'   # does anything match the topic filter?
 mosquitto_sub -v -t 'home/#'      # is anything published at all?
 ```
 

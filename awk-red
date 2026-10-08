@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# awk-red - a Node-RED style event router built on MQTT and AWK.
+# awk-red - a Node-RED style event router built on AWK.
 #
 # This script is the application. It does everything gawk is bad at:
 #   * loads .env and exports the configuration
@@ -8,17 +8,22 @@
 #   * checks dependencies and gawk version
 #   * discovers rule files and assembles the gawk program
 #   * line-buffers the pipeline (see "Buffering" in README.md)
-#   * starts optional HTTP listener and supervises child processes cleanly
+#   * starts the enabled input sources and supervises child processes cleanly
+#
+# Inputs are opt-in: --mqtt subscribes to the broker, --http-port listens for
+# webhooks, --tick runs the clock, -i replays a recording. At least one is
+# required. MQTT_HOST/MQTT_PORT configure the broker for pub() either way.
 #
 # gawk does what awk is good at: matching, transforming and dispatching.
 #
-#   usage: awk-red [-h host] [-p port] [-t topic] [-r rules] [-e env]
-#                 [-i file] [-n] [-l] [-v] [-q] [-?] [--version]
+#   usage: awk-red [--mqtt [-h host] [-p port]] [--http-port [port]]
+#                 [--tick seconds] [-i file] [-t topic] [-r rules] [-e env]
+#                 [-n] [-l] [-v] [-q] [-?] [--version]
 #
 set -euo pipefail
 
 readonly PROG=awk-red
-readonly VERSION=v0.2.1
+readonly VERSION=v0.3.0
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     printf '%s: bash 4.4 or newer is required (found %s)\n' "$PROG" "$BASH_VERSION" >&2
@@ -30,33 +35,37 @@ readonly SELF_DIR
 readonly ENGINE="$SELF_DIR/lib/router.awk"
 readonly HTTP_ENGINE="$SELF_DIR/lib/http.awk"
 
-# exit codes: 0 ok, 1 runtime/dependency error, 2 usage error
+# exit codes: 0 ok, 1 runtime/dependency error, 2 usage error; see the final
+# status block - a live input that failed carries its own status (5 on a
+# refused login) and a stop signal (130/143) exits 0.
 die() { local code=${2:-1}; printf '%s: %s\n' "$PROG" "$1" >&2; exit "$code"; }
 usage_error() { die "$1" 2; }
 
-say() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 warn() { [[ -n $OPT_QUIET ]] || printf '%s: warning: %s\n' "$PROG" "$*" >&2; }
 
 usage() {
     cat <<EOF
-$PROG $VERSION - MQTT event router: mosquitto_sub -> gawk -> rules
+$PROG $VERSION - event router: inputs -> gawk -> rules
 
-usage: $PROG [options]
-
-options:
-  -h, --host HOST     broker hostname          (MQTT_HOST,   default localhost)
-  -p, --port PORT     broker port             (MQTT_PORT,   default 1883)
-  -t, --topic FILTER  subscription filter     (MQTT_TOPIC,  default '#')
-  -r, --rules DIR     rule directory, *.awk loaded in sorted order
-                                                 (AWKRED_RULES, default examples)
-  -e, --env FILE      env file to load        (AWKRED_ENV,  default ./.env)
-  -i, --input FILE    read messages from FILE ('-' = stdin) instead of MQTT
-      --tick SECONDS  publish a clock message on awk-red/tick/<timestamp>
-                      every SECONDS, so rules can run on a schedule even when
-                      the broker is silent (AWKRED_TICK, default 0 = off)
+inputs (at least one is required):
+      --mqtt          subscribe to the broker        (AWKRED_MQTT, default off)
+  -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
+      --tick SECONDS  a clock message on awk-red/tick/<timestamp> every SECONDS
+                      (AWKRED_TICK, default 0 = off)
   -P, --http-port [PORT]  listen for HTTP requests on all interfaces
                       (AWKRED_HTTP_PORT, default 0 = off; -P alone uses 8080)
-  -n, --dry-run      print commands instead of running them (DRYRUN=1)
+
+broker (for --mqtt and for pub() in every mode):
+  -h, --host HOST     broker hostname                (MQTT_HOST,   default localhost)
+  -p, --port PORT     broker port                    (MQTT_PORT,   default 1883)
+  -t, --topic FILTER  subscription filter            (MQTT_TOPIC,  default '#')
+                      credentials and TLS: MQTT_USER, MQTT_PASS, MQTT_TLS
+
+options:
+  -r, --rules DIR     rule directory, *.awk loaded in sorted order
+                                                 (AWKRED_RULES, default examples)
+  -e, --env FILE      env file to load           (AWKRED_ENV,  default ./.env)
+  -n, --dry-run       print commands instead of running them (DRYRUN=1)
   -l, --list-rules    list the loaded rules and exit
   -v, --verbose       log routing decisions to stderr (AWKRED_VERBOSE=1)
   -q, --quiet         only report errors
@@ -68,7 +77,8 @@ precedence: command line > environment > .env > built-in default
 
 examples:
   $PROG -n -i examples/messages.log       dry run against a recording
-  $PROG --tick 300 -r ./rules             run for real, with a clock
+  $PROG --mqtt -h mqtt.local -r ./rules   subscribe, with your own rules
+  $PROG --tick 300 -r ./rules             clock only, no broker needed
   $PROG -l -r ./rules                     show what would handle what
 EOF
 }
@@ -78,6 +88,7 @@ EOF
 OPT_HOST="" OPT_PORT="" OPT_TOPIC="" OPT_RULES="" OPT_ENV=""
 OPT_INPUT="" OPT_DRYRUN="" OPT_LIST="" OPT_VERBOSE="" OPT_QUIET=""
 OPT_FIRST_MATCH="" OPT_HELP="" OPT_VERSION="" OPT_TICK="" OPT_HTTP_PORT=""
+OPT_MQTT=""
 
 need_value() { (( $2 >= 2 )) || usage_error "option $1 requires a value"; }
 
@@ -105,6 +116,7 @@ while (( $# )); do
         --input=*)          OPT_INPUT=${1#*=}; shift ;;
         --tick)             need_value "$1" $#; OPT_TICK=$2; shift 2 ;;
         --tick=*)           OPT_TICK=${1#*=}; shift ;;
+        --mqtt)             OPT_MQTT=1; shift ;;
         -n|--dry-run)       OPT_DRYRUN=1; shift ;;
         -l|--list-rules)    OPT_LIST=1; shift ;;
         -v|--verbose)       OPT_VERBOSE=1; shift ;;
@@ -128,7 +140,7 @@ done
 # variables that were already exported win over whatever .env sets.
 CONFIG_VARS="MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASS MQTT_TLS MQTT_CAFILE \
 MQTT_CLIENT_ID MQTT_TOPIC DRYRUN AWKRED_RULES AWKRED_FIRST_MATCH \
-AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT"
+AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT"
 
 declare -A PRESET=()
 for name in $CONFIG_VARS; do
@@ -169,6 +181,13 @@ RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-examples}}
 DRYRUN=${OPT_DRYRUN:-${DRYRUN:-0}}
 TICK=${OPT_TICK:-${AWKRED_TICK:-0}}
 HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-0}}
+# The subscription is opt-in: --mqtt or AWKRED_MQTT=1. MQTT_HOST/MQTT_PORT are
+# broker configuration for pub() as well, so setting them never switches the
+# input on by itself.
+MQTT_ON=0
+if [[ -n $OPT_MQTT || ${AWKRED_MQTT:-0} =~ ^(1|true|yes|on)$ ]]; then
+    MQTT_ON=1
+fi
 export MQTT_HOST MQTT_PORT MQTT_TOPIC DRYRUN
 export AWKRED_RULES="$RULES_DIR"
 export AWKRED_PROG="$PROG"
@@ -192,10 +211,21 @@ if [[ ! $HTTP_PORT =~ ^[0-9]+$ ]] || (( HTTP_PORT < 0 || HTTP_PORT > 65535 )); t
     usage_error "--http-port takes a port number 1-65535, 0 to disable (got: $HTTP_PORT)"
 fi
 if [[ -n $OPT_INPUT ]]; then
+    if [[ -n $OPT_MQTT ]]; then
+        usage_error "--mqtt cannot be combined with --input"
+    fi
     if [[ -n $OPT_HTTP_PORT && $OPT_HTTP_PORT -gt 0 ]]; then
         usage_error "--http-port cannot be combined with --input"
     fi
     HTTP_PORT=0
+    MQTT_ON=0
+fi
+
+# A run with no input at all would sit on a fifo nobody writes to, so name the
+# ways in instead. --list-rules exits before any of this matters.
+if [[ -z $OPT_INPUT ]] && (( OPT_LIST == 0 )) &&
+   (( MQTT_ON == 0 && HTTP_PORT == 0 && TICK == 0 )); then
+    usage_error "no input source: enable one with --mqtt, --http-port, --tick or --input"
 fi
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 not found${2:+ ($2)}"; }
@@ -206,8 +236,9 @@ need_cmd timeout "install: sudo apt install coreutils"
 # MOSQ_SUB can be set in the environment to substitute the subscriber, which is
 # how test/ injects a fake one that accepts, denies or stalls. It is a tool path
 # rather than configuration, so it is deliberately not part of .env precedence.
+# The subscriber itself is only needed when the MQTT input is on.
 MOSQ_SUB=${MOSQ_SUB:-$(command -v mosquitto_sub || true)}
-if [[ -z $OPT_INPUT && -z $MOSQ_SUB ]]; then
+if (( MQTT_ON )) && [[ -z $MOSQ_SUB ]]; then
     need_cmd mosquitto_sub "install: sudo apt install mosquitto-clients"
 fi
 
@@ -288,7 +319,7 @@ if [[ -z $OPT_QUIET ]]; then
     printf '%s %s\n' "$PROG" "$VERSION" >&2
     if [[ -n $OPT_INPUT ]]; then
         printf '  input    %s\n' "$OPT_INPUT" >&2
-    else
+    elif (( MQTT_ON )); then
         printf '  broker   %s:%s topic %s\n' "$MQTT_HOST" "$MQTT_PORT" "$MQTT_TOPIC" >&2
     fi
     printf '  rules    %s (%d file(s))\n' "$RULES_DIR" "${#RULE_FILES[@]}" >&2
@@ -316,10 +347,10 @@ fi
 
 # ------------------------------------------------------------- live mode
 #
-# mosquitto_sub and gawk are connected through a fifo instead of a plain
-# pipeline, so the writer is a process of its own that can be shut down
-# deterministically: when gawk dies, the writer is stopped instead of leaving
-# mosquitto_sub on the broker until the next message arrives.
+# The enabled input sources and gawk are connected through a fifo instead of a
+# plain pipeline, so the writer is a process of its own that can be shut down
+# deterministically: when gawk dies, the writer is stopped instead of leaving a
+# subscription on the broker or a listener on a port behind.
 fifo=$(mktemp -u "${TMPDIR:-/tmp}/awk-red.XXXXXX") || die "mktemp failed"
 mkfifo "$fifo" || die "mkfifo failed: $fifo"
 
@@ -341,12 +372,34 @@ stop_child() {
 }
 
 cleanup() {
-    trap - EXIT INT TERM HUP
+    # A wakeup signal can be delivered twice on one shutdown (observed on runs
+    # stopped by a timeout, which signals the whole process group). The second
+    # one used to arrive right after the first had cleared every trap but
+    # before this body could remove the fifo, so bash died of the default
+    # disposition and left the fifo - and the stall it causes - behind. Ignore
+    # the signals for the duration and restore the defaults only once the fifo
+    # is gone.
+    trap '' INT TERM HUP
     stop_child "$engine_pid"
     stop_child "$writer_pid"
     rm -f "$fifo"
+    trap - EXIT INT TERM HUP
 }
 trap cleanup EXIT INT TERM HUP
+
+# HTTP listener. Writes the same MQTT-style lines to the fifo as a live
+# subscription would, one per request.
+http_loop() {
+    local sleeper="" rc=0
+    trap 'kill "${sleeper:-}" 2>/dev/null; exit 0' TERM INT
+    stdbuf -oL "$GAWK" -v PORT="$HTTP_PORT" -f "$HTTP_ENGINE" &
+    sleeper=$!
+    # The listener's status is this loop's status: a listener that crashed has
+    # to reach write_loop, which ends the run with it instead of leaving a run
+    # that looks healthy with no webhook port.
+    wait "$sleeper" 2>/dev/null || rc=$?
+    return "$rc"
+}
 
 # The clock. gawk has no timers and no concurrency - a handler that waits blocks
 # the whole stream, and nothing inside the process can fire while the broker is
@@ -358,17 +411,6 @@ trap cleanup EXIT INT TERM HUP
 # which is ready for arithmetic against systime(). A rule matching the topic is
 # an ordinary rule, so it is testable offline by putting the same line into a
 # recording.
-#
-# HTTP listener. Writes the same MQTT-style lines to the fifo as a live
-# subscription would, one per request.
-http_loop() {
-    local sleeper=""
-    trap 'kill "${sleeper:-}" 2>/dev/null; exit 0' TERM INT
-    stdbuf -oL "$GAWK" -v PORT="$HTTP_PORT" -f "$HTTP_ENGINE" &
-    sleeper=$!
-    wait "$sleeper" 2>/dev/null || true
-}
-
 tick_loop() {
     local stamp sleeper=""
     local remaining
@@ -386,60 +428,103 @@ tick_loop() {
     done
 }
 
-sub_opts=(-h "$MQTT_HOST" -p "$MQTT_PORT" -v -t "$MQTT_TOPIC")
-[[ -n ${MQTT_USER:-} ]] && sub_opts+=(-u "$MQTT_USER")
-[[ -n ${MQTT_PASS:-} ]] && sub_opts+=(-P "$MQTT_PASS")
-if [[ ${MQTT_TLS:-0} == 1 || -n ${MQTT_CAFILE:-} ]]; then
-    sub_opts+=(--cafile "${MQTT_CAFILE:-/etc/ssl/certs/ca-certificates.crt}")
+sub_opts=()
+if (( MQTT_ON )); then
+    sub_opts=(-h "$MQTT_HOST" -p "$MQTT_PORT" -v -t "$MQTT_TOPIC")
+    [[ -n ${MQTT_USER:-} ]] && sub_opts+=(-u "$MQTT_USER")
+    [[ -n ${MQTT_PASS:-} ]] && sub_opts+=(-P "$MQTT_PASS")
+    if [[ ${MQTT_TLS:-0} == 1 || -n ${MQTT_CAFILE:-} ]]; then
+        sub_opts+=(--cafile "${MQTT_CAFILE:-/etc/ssl/certs/ca-certificates.crt}")
+    fi
+    [[ -n ${MQTT_CLIENT_ID:-} ]] && sub_opts+=(-i "$MQTT_CLIENT_ID")
 fi
-[[ -n ${MQTT_CLIENT_ID:-} ]] && sub_opts+=(-i "$MQTT_CLIENT_ID")
 
 # The writer. Everything that writes to the fifo lives in here, which is one
-# process instead of three children of awk-red:
+# process instead of several children of awk-red:
 #
 #   write_loop (subshell, owns the fifo)
-#     |- mosquitto_sub   the subscription
-#     |- tick_loop       the clock, if --tick is on
-#     |- http_loop       HTTP listener, if --http-port is on
+#     |- mosquitto_sub   the subscription, when --mqtt is on
+#     |- tick_loop       the clock, when --tick is on
+#     |- http_loop       HTTP listener, when --http-port is on
 #
-# The run therefore ends with the subscription rather than with the clock.
-# Waiting for the subscriber is what makes a refused login, a broker that went
-# away or a plain disconnect close the fifo; the engine sees end of input and
-# exits by itself. That is why there is no poll loop here: an earlier version
-# checked whether the subscriber was still alive every half second, which needed
-# /proc to tell a zombie from a live process, and it still had to guess whether
-# the engine's 143 was a failure or a deliberate stop.
+# What the run waits for follows from which inputs are on:
+#
+#   * with --mqtt the subscription is the terminator: a refused login, a broker
+#     that went away or a plain disconnect ends the wait, the writer closes the
+#     fifo and the engine sees end of input and exits by itself. The clock and
+#     the listener are auxiliaries and are stopped the moment it returns.
+#   * without a subscription there is no terminator, so the lifetime is
+#     signal-only: wait -n returns as soon as *any* source exits, its status
+#     ends the run, and the survivors are stopped so the fifo still closes.
+#     wait -n says neither which child it reaped nor (before bash 5.1) any way
+#     to ask, so the dead one is found with kill -0: the reaped pid is gone,
+#     every survivor still answers. That is the whole liveness check - no poll
+#     loop, no /proc, no half-second of latency.
 #
 # The traps below belong to the writer subshell, which lives exactly as long as
-# this function. Being the parent of both children is the whole point: a signal
-# to the writer takes them with it, and nothing can be left on the broker.
+# this function. Being the parent of every child is the whole point: a signal to
+# the writer takes them with it, and nothing is left on the broker or on a port.
+# The trap exits with $rc, not 0: a failure that has already been reaped must
+# not be turned into a clean stop by a shutdown arriving a moment later.
 write_loop() {
     local sub_pid="" tick_pid="" http_pid=""
+    local rc=0 src="" idx
+    local -a src_names=() src_pids=()
 
-    trap 'kill ${http_pid:+"$http_pid"} ${tick_pid:+"$tick_pid"} ${sub_pid:+"$sub_pid"} 2>/dev/null; exit 0' TERM INT
+    trap 'kill ${http_pid:+"$http_pid"} ${tick_pid:+"$tick_pid"} ${sub_pid:+"$sub_pid"} 2>/dev/null; exit "$rc"' TERM INT
 
     # A second writer on the same fifo. Writes below PIPE_BUF are atomic, so a
     # tick line can never be spliced into a real message.
     if (( HTTP_PORT > 0 )); then
         http_loop &
         http_pid=$!
+        src_names+=("http listener")
+        src_pids+=("$http_pid")
     fi
     if (( TICK > 0 )); then
         tick_loop &
         tick_pid=$!
+        src_names+=("clock")
+        src_pids+=("$tick_pid")
     fi
 
-    # Both stages are line-buffered: without this the pipe chain stalls until
-    # 4-8 KB have piled up, and nothing happens to look at.
-    stdbuf -oL "$MOSQ_SUB" "${sub_opts[@]}" &
-    sub_pid=$!
+    if (( MQTT_ON )); then
+        # Both stages are line-buffered: without this the pipe chain stalls
+        # until 4-8 KB have piled up, and nothing happens to look at.
+        stdbuf -oL "$MOSQ_SUB" "${sub_opts[@]}" &
+        sub_pid=$!
+        wait "$sub_pid" || rc=$?
+        src="mosquitto_sub"
+        # The clock and HTTP listener have no reason to outlive the subscription.
+        stop_child "$tick_pid"
+        stop_child "$http_pid"
+    else
+        wait -n || rc=$?
+        for idx in "${!src_pids[@]}"; do
+            if kill -0 "${src_pids[idx]}" 2>/dev/null; then
+                stop_child "${src_pids[idx]}"
+            elif [[ -z $src ]]; then
+                src=${src_names[idx]}
+            fi
+        done
+        [[ -n $src ]] || src="input source"
+    fi
 
-    local rc=0
-    wait "$sub_pid" || rc=$?
+    # SIGPIPE to a source means the fifo's only reader - the engine - is gone,
+    # which is the engine's story and not a source failure: drop it so the
+    # engine's own status is what gets reported, and no "exited with status
+    # 141" is printed for a shutdown artefact.
+    if (( rc == 141 )); then
+        rc=0
+    fi
 
-    # The clock and HTTP listener have no reason to outlive the subscription.
-    stop_child "$tick_pid"
-    stop_child "$http_pid"
+    # A source that failed - a refused login, a listener that crashed - ends the
+    # run with its status so systemd restarts us, and is named here, on stderr,
+    # because "exited with status N" is useless without the name. 130/143 means
+    # we stopped it ourselves, which is not a failure.
+    if (( rc != 0 && rc != 130 && rc != 143 )); then
+        printf '%s: %s exited with status %d\n' "$PROG" "$src" "$rc" >&2
+    fi
     return "$rc"
 }
 
@@ -450,13 +535,21 @@ stdbuf -oL "$GAWK" "${GAWK_OPTS[@]}" < "$fifo" &
 engine_pid=$!
 
 # The engine is the process whose status awk-red reports, because the engine is
-# where the work happens. The writer's status is what says why: when the
-# subscription ended first, the engine did nothing wrong and only saw end of
-# input. So a refused login arrives as mosquitto_sub's own exit 5.
+# where the work happens. The writer's status is what says why: when an input
+# ended first, the engine did nothing wrong and only saw end of input. So a
+# refused login arrives as mosquitto_sub's own exit 5 - write_loop has already
+# named the source on stderr.
 status=0
 writer_status=0
 set +e
 wait "$engine_pid" || status=$?
+# The engine is gone, so the writer has nothing left to feed: stop it. In the
+# normal order the writer has already exited (it closed the fifo, the engine saw
+# end of input), this kill is a no-op and its status is reaped unchanged. The
+# other order is a broken rule or a crash in the engine - without this line the
+# subscription or the clock kept running with nothing reading the fifo, and
+# awk-red hung for ever.
+kill -TERM "$writer_pid" 2>/dev/null
 wait "$writer_pid" || writer_status=$?
 set -e
 
@@ -464,13 +557,12 @@ engine_pid="" writer_pid=""
 trap - EXIT INT TERM HUP
 rm -f "$fifo"
 
-# A subscription that ended in failure - a rejected login, a broker that went
-# away - is a real failure and has to be reported as one, so systemd restarts
-# us. It also explains a 143 from the engine: it was stopped because there was
-# nothing left subscribed to. A 130/143 from the writer instead means we stopped
-# both ourselves, on a signal, which is not an error.
+# A source that failed - a rejected login, a broker that went away - is a real
+# failure and has to be reported as one, so systemd restarts us. It also
+# explains a 143 from the engine: it was stopped because the input that fed it
+# was gone. A 130/143 from the writer instead means we stopped both ourselves,
+# on a signal, which is not an error.
 if (( writer_status != 0 && writer_status != 130 && writer_status != 143 )); then
-    say "mosquitto_sub exited with status $writer_status"
     status=$writer_status
 elif (( status == 130 || status == 143 )); then
     status=0

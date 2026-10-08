@@ -7,8 +7,9 @@ rules work out of the box and double as a starting point for your own.
 ./awk-red -l                        # what is in here
 ./awk-red -n -i messages.log       # dry run against the recording
 ./awk-red -v -i messages.log       # the same, with routing decisions logged
-./awk-red -n -h mqtt.local         # live, dry run against a real broker
-./awk-red --tick 2 -h mqtt.local   # live, with a clock every 2 s
+./awk-red --tick 2                 # the clock alone, no broker needed
+./awk-red -n --mqtt -h mqtt.local  # live, dry run against a real broker
+./awk-red --mqtt -h mqtt.local --tick 2   # live, with a clock every 2 s
 ```
 
 | File | Shows |

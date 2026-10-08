@@ -32,7 +32,7 @@ those live in `awk-red`:
 | --- | --- | --- |
 | load `.env`, export configuration | shell | sourcing a file is shell work; AWK has no file inclusion at all |
 | flags, defaults, precedence | shell | `getopts` / `case` beats AWK's `ARGV` juggling |
-| check that `gawk`, `mosquitto_sub` and `stdbuf` exist | shell | `command -v`, and a good error message |
+| check that `gawk` and `stdbuf` exist (`mosquitto_sub` only with `--mqtt`) | shell | `command -v`, and a good error message |
 | discover rule files, build the program | shell | globbing and sorting are shell work |
 | line buffering | shell | must be set on the process *before* it starts |
 | know the pids, shut them down | shell | AWK has no process supervision |
@@ -239,7 +239,7 @@ process:
 
 ```
 write_loop (background subshell, owns the fifo)
-  |- mosquitto_sub     the subscription
+  |- mosquitto_sub     the subscription, only with --mqtt
   |- tick_loop         the clock, when --tick is on
   |- http_loop         the HTTP listener, when --http-port is on
 
@@ -247,17 +247,25 @@ gawk -f lib/router.awk ... < "$fifo"          the engine
 ```
 
 `write_loop` runs as a subshell with the fifo as its stdout, so starting the
-subscriber and the clock are ordinary child starts and `wait`ing for the
-subscriber is legal - it is this process's own child, not a sibling. That one
+subscriber and the clock are ordinary child starts and `wait`ing for a child
+is legal - it is this process's own child, not a sibling. That one
 rule is what the fifo bought:
 
-* **The run ends with the subscription.** A refused login, a broker that went
-  away or a plain disconnect ends the `wait`, the writer closes the fifo, and
-  the engine sees end of input and exits by itself.
+* **With `--mqtt`, the run ends with the subscription.** A refused login, a
+  broker that went away or a plain disconnect ends the `wait`, the writer
+  closes the fifo, and the engine sees end of input and exits by itself.
 * **The writer's status is mosquitto_sub's status**, so a rejected login
-  arrives as exit 5 instead of as a silent success.
+  arrives as exit 5 instead of as a silent success - named on stderr as
+  `mosquitto_sub exited with status 5`.
 * **The clock cannot outlive the subscription**, because the writer is its
   parent and kills it on the way out.
+
+Without `--mqtt` there is no terminator to wait on, so `write_loop` waits on
+whichever sources exist with `wait -n` instead: the first one to finish is
+identified with `kill -0` (it was just reaped, so only the survivors still
+answer) and its status is reported under its own name - `http listener exited
+with status 137`, `clock exited with status N`. The signal-only lifetime that
+follows from that is described under *Inputs are opt-in* below.
 
 awk-red then waits for the engine and reports its status, falling back to the
 writer's status only when the engine had nothing to fail about. Either process
@@ -278,19 +286,29 @@ were shell bugs:
   and I stopped the reader" or "somebody asked us to stop", and the exit status
   alone cannot tell you which.
 
-One writer process makes all three questions unnecessary, and `wait -n` would
-not have helped either: it reports that a child finished but swallows which one
-and what it returned. Polling also cost up to half a second of shutdown latency;
-with the writer, a dead subscription ends the run in roughly 30 ms.
+One writer process makes all three questions unnecessary. `wait -n` turned out
+to be enough after all: it returns the status of *a* finished child, and
+because it has already reaped that child, a `kill -0` pass separates the dead
+one (no such process any more) from the survivors (still answer). That gives
+both the status and the identity without polling anything. Polling also cost up
+to half a second of shutdown latency; with the writer, a dead subscription ends
+the run in roughly 30 ms.
 
 ## HTTP on the same fifo
 
-`--http-port` puts a third writer in `write_loop`. It had to live there: the
-run ends with the subscription, and if the listener kept the fifo open after
-that, the engine would never see end of input and awk-red would hang on its
-final `wait`. So `http_loop` is started only when the port is on, added to the
-`TERM`/`INT` trap alongside the other children, and `stop_child`-ed the moment
-the subscription's `wait` returns.
+`--http-port` puts another writer in `write_loop`. It had to live there: with
+`--mqtt`, the run ends with the subscription, and if the listener kept the fifo
+open after that, the engine would never see end of input and awk-red would hang
+on its final `wait`. So `http_loop` is started only when the port is on and is
+added to the `TERM`/`INT` trap alongside the other children.
+
+`http_loop` also propagates what it waits on: the listener's exit status
+becomes the subshell's status, which `write_loop` reports under its own name
+(`http listener exited with status N`). Without that, a listener that crashed
+on start-up or was killed mid-run would leave a run that looks healthy while
+answering nothing - the exact failure the preflight only covers for the
+"port taken" case. With `--http-port` as the *only* input, that status is the
+whole story of the run, which is what makes an http-only mode viable.
 
 Everything else about it is gawk's `/inet/tcp`, which is not a web server:
 
@@ -352,6 +370,13 @@ sleep in the background and kills it from the trap. And a script that dies on
 `SIGTERM` leaves its foreground child behind, so a trap has to kill the child
 too, not just exit.
 
+One shutdown artefact is filtered out rather than explained: a source that
+dies of `SIGPIPE` (exit 141) can only do so because the fifo's reader, the
+engine, is gone - with the engine alive there is always someone to read. That
+is the engine's story, not the source's failure, so `write_loop` drops a 141
+instead of reporting it as a dead input. Without that rule the engine's own
+shutdown would race the clock and report `clock exited with status 141`.
+
 ## Process bugs are shell bugs, not AWK bugs
 
 Every bug found while building the clock was in the shell layer: the ticker's
@@ -382,7 +407,7 @@ subscription, one that dies, one that delivers nothing, one that block-buffers.
 Nothing that shaped the supervision code was an MQTT bug, so a real broker would
 only add flakiness.
 
-Three traps the tests had to avoid, each of which cost time:
+Four traps the tests had to avoid, each of which cost time:
 
 * **Background jobs ignore `SIGINT`.** A Ctrl-C case that runs awk-red with `&`
   and then sends `SIGINT` passes for the wrong reason: the signal was inherited
@@ -397,6 +422,11 @@ Three traps the tests had to avoid, each of which cost time:
   buffering bug it was written to catch. The fake now takes an explicit payload,
   and the case inspects the output while awk-red is still running, so a
   block-buffered engine cannot pass by being flushed at exit.
+* **A developer's `.env` reaches every case.** Since inputs are opt-in, an
+  `AWKRED_MQTT=1` (or `--mqtt` baked into a shell alias) in the environment
+  would quietly subscribe in cases that exist to prove no subscription happens.
+  The suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0` and `AWKRED_HTTP_PORT=0`
+  before running anything, so each case names its own inputs and only its own.
 
 The suite is worth what its failures are worth, so each guarantee was checked by
 breaking it on purpose: removing `stdbuf -oL` fails the buffering case, removing
@@ -437,7 +467,7 @@ arrived three seconds late after one three-second handler), and `sleep()` is not
 even available in a stock build. AWK has no timers and no concurrency, so
 nothing inside the router can fire while input is idle.
 
-The clock therefore lives in `awk-red`, as a third writer on the fifo:
+The clock therefore lives in `awk-red`, as another writer on the fifo:
 
 ```
 awk-red/tick/2026-10-03T11:22:33Z 1756899753
@@ -454,27 +484,26 @@ Two costs, both accepted deliberately:
 
 * **EOF.** A second writer holds the fifo open, so gawk no longer sees EOF when
   `mosquitto_sub` disconnects. Supervision therefore cannot rely on the pipe
-  closing, and the run now ends when *either* stage stops rather than when the
-  reader does. Polling looked like the wrong tool for this - a child that exited
+  closing: with `--mqtt` the writer waits on the subscription and stops the
+  other sources when it returns, and without it the writer waits on the
+  sources themselves with `wait -n`, reaping the first one to finish and
+  naming it. Polling looked like the wrong tool for this - a child that exited
   without being reaped is a zombie that still answers `kill -0`, which is
   exactly how the first version of this passed a rejected login and then hung
-  for ever with the ticker running. Liveness is therefore read from
-  `/proc/<pid>/stat` (with a `kill -0` fallback), at the price of one small file
-  read and up to half a second of shutdown latency. The alternatives were
-  worse: a watchdog subshell cannot `wait` for a sibling, since `wait` only
-  accepts children, and bash 5.1's `wait -n` swallows the exit status of the
-  child it reports - which is the one thing needed to tell a deliberate stop
-  from a dead subscription.
+  for ever with the ticker running. `wait -n` is the fix precisely because it
+  *reaps*: once the finished child is gone, `kill -0` sorts the dead one from
+  the survivors without reading `/proc` or timing anything.
 * **Feedback.** With `-t '#'` the router receives its own published messages.
   A rule that publishes to the topic it matches re-triggers itself once per
   interval, so `awk-red/tick/` is write-once by contract and heartbeat output
   goes to `awk-red/heartbeat/`. The contract is documented where the rule is
   written, in `examples/heartbeat.awk`.
 
-Exit status follows from the same split: a subscription that failed on its own
-is reported with its own status so systemd restarts the service, and only a
-130/143 without that failure counts as a stop we asked for. A reader stopped
-for that reason exits 143, which is why the subscription check runs first.
+Exit status follows from the same split: a source that failed on its own is
+reported with its own status under its own name so systemd restarts the
+service, and only a 130/143 without such a failure counts as a stop we asked
+for. A source stopped for that reason exits 143, which is why the failure check
+runs first.
 
 The interval is one number, off by default, because a clock nobody asked for is
 a surprise in a router that is otherwise purely reactive.
@@ -496,56 +525,146 @@ cannot be confused. It is not built, because nothing outside needs it yet.
 Note that the `%` in a crontab line is a newline to cron, which is an argument
 for a systemd timer over cron regardless.
 
-## Webhook-only mode (planned)
+## Inputs are opt-in (built in v0.3.0)
 
-`--input` already gives a broker-free mode, but only for a recording. There is
-no *live* broker-free mode: `--http-port` still starts a subscription, and the
-run still ends when that subscription does. Making the subscriber optional
-would close the missing quadrant - a router driven only by webhooks or only by
-the clock - and it is a small change to the flags but a real change to the
-lifetime model, which is why it is written down here before being built.
+Until v0.3.0 a run always subscribed: `--http-port` and `--tick` still needed
+a broker, and `mosquitto_sub` was an unconditional dependency. That made a
+webhook-only or clock-only router impossible, and worse, it made the *default*
+run a live subscription that nobody had asked for. `--input` already gave a
+broker-free mode, but only for a recording.
 
-The lifetime is the whole problem. `write_loop` treats the clock and the HTTP
-listener as auxiliaries and waits on `mosquitto_sub`; when that returns it
-stops the auxiliaries, the fifo reaches EOF and the engine exits. With no
-subscription there is no terminator, so the roles invert and the remaining
-input sources become primary.
+Inputs are now a set, each one asked for separately:
 
-Decisions already made:
+```
+--mqtt        AWKRED_MQTT       the broker subscription
+--http-port   AWKRED_HTTP_PORT  HTTP webhooks
+--tick        AWKRED_TICK       the clock
+-i FILE                       a recording (exclusive with the rest)
+```
 
-* **Signal-only lifetime.** With the subscription gone the run ends on
-  `SIGTERM`/`SIGINT`, not when an input goes quiet.
-* **A dead input is fatal.** `http_loop` currently swallows the listener's exit
-  status (`wait "$sleeper" || true`), so a crashed or wedged listener would
-  look like a healthy run. It has to propagate that status and `write_loop` has
-  to return it, so systemd restarts the service. The reporter needs to name the
-  source too: "mosquitto_sub exited with status N" is wrong when the HTTP
-  listener was the one that died.
-* **No broker tooling required.** `mosquitto_sub` is required only when MQTT is
-  on, mirroring the existing `--input` exemption, and the `mosquitto_pub`
-  warning is suppressed when MQTT is off. `pub()` still works if
-  `mosquitto_pub` happens to be installed.
+At least one is required, otherwise it is a usage error (exit 2) - a run with
+nothing to read would sit in its final `wait` forever, so refusing it outright
+is the only honest option. `--input` is exclusive with every live input for the
+same reason: a recording is already a complete stream, so `--mqtt`, `--http-port`
+and `--tick` are all rejected when it is given.
 
-Still open: how the mode is selected. The trade-off is the default.
+The selection mechanism is a flag plus a truthy environment variable, default
+off. The alternatives were weighed before building:
 
 | Option | Effect |
 | --- | --- |
-| `--no-mqtt` / `AWKRED_MQTT=0` | Non-breaking: MQTT stays on by default. Orthogonal to inputs, so a tick-only scheduler falls out for free. |
-| `--mqtt` / `AWKRED_MQTT=1`, defaulting off | Matches "turn MQTT on explicitly", but flips the default for every existing deployment and needs a migration note. |
-| `--input`-style selector over `mqtt`, `http`, `tick` | Clearest mental model - a run has a set of input sources - at the cost of the largest surface. |
+| `--no-mqtt` / `AWKRED_MQTT=0`, MQTT on by default | Non-breaking, but keeps the surprise: a bare `./awk-red` is a live subscription. |
+| `--mqtt` / `AWKRED_MQTT=1`, defaulting off (chosen) | "Turn MQTT on explicitly"; flips the default, which is fine while v0 has no users to migrate. |
+| `--input`-style selector over `mqtt`, `http`, `tick` | Clearest mental model, at the cost of the largest surface - and sources combine (`--mqtt --tick`) anyway, so it would be a set of booleans with more syntax. |
 
-All three share the same validation: MQTT off requires at least one of
-`--tick` and `--http-port`, otherwise there is nothing to do and it is a usage
-error. The run-lifetime and reporting changes above are the same in each.
+What actually had to change was the lifetime model, not the flags:
+
+* **The subscription stopped being the terminator.** With `--mqtt` it still
+  is: `write_loop` waits on `mosquitto_sub`, and a refused login ends the run
+  with status 5, exactly as before. Without it the writer waits on whichever
+  sources exist with `wait -n` and stops the survivors when the first one
+  ends. With no source failing at all the lifetime is signal-only: the run
+  ends on `SIGTERM`/`SIGINT`, which is what systemd sends anyway.
+* **A dead input is fatal and named.** `http_loop` used to swallow the
+  listener's status (`wait "$sleeper" || true`); it propagates it now, and
+  `write_loop` reports the source under its own name - `mosquitto_sub exited
+  with status N` was simply wrong when the HTTP listener was the one that
+  died.
+* **No broker tooling required.** `mosquitto_sub` is checked (and the banner
+  prints a broker line) only when MQTT input is on, mirroring the `--input`
+  exemption. The `mosquitto_pub` warning still appears when `pub()` has no
+  client, because that is about *outgoing* messages in any mode - and
+  `MQTT_HOST`/`MQTT_PORT` configure `pub()` whether or not the input is on,
+  which is why setting them alone never switches anything.
+
+## Other input sources
+
+The engine does not know what an input *is*. It reads lines and splits each one
+at the first space: everything before is the topic, everything after is the
+payload. `mosquitto_sub`, `tick_loop` and `http_loop` are three different
+programs that all happen to write that one format to the fifo, so "add a new
+input" almost never means touching the engine - it means writing one more bridge
+to the same wire.
+
+What it *does* mean is a change in `write_loop`, and that change is now made:
+v0.3.0 turned a run into a *set* of input sources, each started, stopped and
+status-reported on its own, with the lifetime decisions from *Inputs are
+opt-in* (signal-only lifetime when nothing fails, a dead input fatal and
+named). The remaining work for a new source is therefore the easy half: start
+it in `write_loop` when its flag is set, kill it from the trap, and let the
+existing `wait -n` reporting pick it up.
+
+The cheapest source is not a new listener but a new command. `mosquitto_sub` is
+already "just a process that prints lines", so the live counterpart of
+`--input FILE` is a supervised `--pipe CMD`, with an optional `--every N`, whose
+stdout is treated exactly like a subscription's. Most of the table below then
+becomes a recipe in the documentation rather than a parser in the repository:
+
+```shell
+# journald -> host/<unit>
+journalctl -f -o cat -n 0
+# a serial sensor
+stty -F /dev/ttyUSB0 9600 raw -echo; cat /dev/ttyUSB0
+# a feed
+curl -fsS https://example.org/feed.xml | some-line-formatter
+```
+
+`--changed` (emit only when the command's output differs from the last run) is
+the edge detector that turns a poll into an event without new state in the
+engine.
+
+### Candidate sources
+
+Roughly by fit and effort:
+
+| Source | Shape | Notes |
+| --- | --- | --- |
+| `--pipe` / `--exec [--every] [--changed]` | any command's stdout | The general case: serial, journald, RSS, redis, sensors. Live counterpart of `--input`. |
+| `--udp-port` | datagrams to `udp/<...> <payload>` | Reuses the gawk `/inet` code `http.awk` is built on: syslog, StatsD, `nc -u`, `echo > /dev/udp`, small IoT devices. Spike first - gawk's UDP is more limited than its TCP (no `READ_TIMEOUT`; "receive from any sender" is not obviously supported). |
+| `--watch PATH` | `inotifywait`, polling fallback | Drop-folder, "backup finished", a rules-reload trigger. |
+| `--follow FILE[:topic]` | `tail -F` lines | Sends a log to rules without a broker. |
+| `--tcp-port` | `topic payload` per line | HTTP's smaller sibling, for scripts that dislike HTTP framing. |
+| `--serial DEV:BAUD` | `stty` + `cat` | Arduino/ESP; also expressible as `--pipe`. |
+| GPIO / `/dev/input` / MIDI | `gpiomon`, `evtest` | Button, motion, "big red button" - all `--pipe` recipes. |
+| host telemetry | `/proc`, `/sys`, `sensors`, `smartctl` | A specialised `--exec`: load, memory, disk, temperature. |
+
+Deliberately not built into the core:
+
+* **RSS/Atom, IMAP, weather and other HTTP APIs.** These are pull, not push:
+  they have to poll, they need "what is new" state that awk-red does not persist
+  yet, and XML or IMAP parsing drags in a dependency that is easy to get wrong
+  on real-world feeds (namespaces, CDATA, entities, encodings). They are
+  `--pipe` recipes, or better, external producers that publish to MQTT or to the
+  HTTP listener.
+* **WebSocket, Kafka, AMQP, Slack/Matrix/IRC.** Each needs auth, TLS and a
+  protocol client; none belongs in a script whose only network dependencies are
+  `gawk` and `mosquitto_sub`.
+
+### Three questions that recur
+
+* **Dedup / last seen.** A poll has no idea what changed; `--changed` and a
+  persisted state file (Roadmap) are the same answer.
+* **Lifetime.** A source that goes quiet is not a source that died - which is
+  exactly the "a dead input is fatal and named" rule that *Inputs are opt-in*
+  put in `write_loop`.
+* **Ordering.** All writers share one fifo, so messages from different sources
+  interleave, but each line is written atomically (below `PIPE_BUF`), so a line
+  is never torn. That is the property that lets a source be a plain `printf`.
 
 ## Roadmap
 
 Roughly in order of value per effort:
 
-* **Webhook-only mode.** Make the subscription optional so HTTP and the clock
-  can be the only input sources; see *Webhook-only mode (planned)* above.
 * **A `topic=` override for webhooks.** Let a request name the engine topic
   instead of deriving it from the method and path; see *HTTP on the same fifo*.
+* **A generic `--pipe` / `--exec` input.** The live counterpart of `--input`:
+  run a command and treat its lines as a subscription, optionally `--every` and
+  `--changed`. Unlocks serial, journald and RSS as recipes rather than code; see
+  *Other input sources*.
+* **A `--watch` / `--follow` input.** File and directory changes, and `tail -F`
+  of a log, as topics; `inotifywait` when present, polling otherwise.
+* **A UDP listener** (`--udp-port`) beside the HTTP one, for syslog, StatsD and
+  one-line senders.
 * **Rate limiting / debounce** with `systime()`: at most one alarm per sensor
   per interval, independent of the state logic each rule writes today.
 * **State persistence**: dump selected variables on `END`, reload in `BEGIN`,

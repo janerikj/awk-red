@@ -6,7 +6,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/awk-red -q -e /etc/awk-red/.env -r /etc/awk-red/rules
+# --mqtt is the subscription: inputs are opt-in, so a unit that wants broker
+# traffic has to ask for it (AWKRED_MQTT=1 in the .env works too).
+ExecStart=/usr/local/bin/awk-red -q --mqtt -e /etc/awk-red/.env -r /etc/awk-red/rules
 Restart=always
 RestartSec=5
 

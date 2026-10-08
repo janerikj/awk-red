@@ -22,6 +22,9 @@ set -m
 cd "$(dirname "$0")/.." || exit 1
 
 export MOSQ_SUB="$PWD/test/fake-mosquitto-sub"
+# Inputs are opt-in and each case names the ones it wants: a developer's .env
+# must not switch one on (or off) behind the suite's back.
+export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=0
 AWKRED="$PWD/awk-red"
 FILTER=${1:-${FILTER:-}}   # ./test/run.sh [case-substring]
 CASE=""
@@ -105,6 +108,22 @@ finish_awkred() {
     wait "$RUN_PID"
 }
 
+# Wait for a run that should end on its own - a failed source closes the fifo
+# and the engine exits - and hand back the exit status. If it does not end, it
+# is a hang: report it, kill it, and let the case still check its output.
+wait_awkred() {
+    local i
+    for (( i = 0; i < 50; i++ )); do
+        kill -0 "$RUN_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$RUN_PID" 2>/dev/null; then
+        bad "still running after 5 s" || true
+        kill -TERM "$RUN_PID" 2>/dev/null || true
+    fi
+    wait "$RUN_PID"
+}
+
 
 
 # Simple HTTP client using /dev/tcp; returns 1 on failure. gawk's listener
@@ -117,7 +136,10 @@ http_get() {
     local resp rc=1 attempt
     for attempt in 1 2 3 4; do
         resp=""
-        if exec 3<>/dev/tcp/127.0.0.1/"$port" 2>/dev/null; then
+        # The 2>/dev/null lives on the brace group, not on exec: a redirection
+        # on exec itself would permanently point the suite's stderr at
+        # /dev/null, and every later failure message would silently vanish.
+        if { exec 3<>/dev/tcp/127.0.0.1/"$port"; } 2>/dev/null; then
             printf 'GET %s HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n' "$path" >&3
             resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
             exec 3<&- 3>&-
@@ -169,7 +191,7 @@ case_tick_off_by_default() {
 case_tick_on_silent_broker() {
     CASE="ticks arrive while the broker sends nothing"
     local rc
-    start_awkred -n -v --tick 1 -h test.invalid
+    start_awkred -n -v --tick 1 --mqtt -h test.invalid
     sleep 3.2
     finish_awkred TERM
     rc=$?
@@ -185,7 +207,7 @@ case_tick_on_silent_broker() {
 case_deny_no_tick() {
     CASE="a refused subscription exits 5 without a clock"
     local rc
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n -h test.invalid >"$OUT" 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt -h test.invalid >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
     grep -qF 'mosquitto_sub exited with status 5' "$ERR" || bad "stderr explains nothing: $(cat "$ERR")"
@@ -199,7 +221,7 @@ case_deny_no_tick() {
 case_deny_with_tick() {
     CASE="a refused subscription exits 5 with a clock (regression)"
     local rc
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
     assert_no_strays
@@ -209,7 +231,7 @@ case_deny_with_tick() {
 case_die_with_tick() {
     CASE="a subscriber that fails outright exits with its status"
     local rc
-    FAKE_SUB_MODE=die FAKE_SUB_CODE=3 timeout 15 "$AWKRED" -n -h test.invalid --tick 1 \
+    FAKE_SUB_MODE=die FAKE_SUB_CODE=3 timeout 15 "$AWKRED" -n --mqtt -h test.invalid --tick 1 \
         >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 3 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
@@ -220,7 +242,7 @@ case_die_with_tick() {
 case_sigterm() {
     CASE="SIGTERM stops everything and exits 0"
     local rc
-    start_awkred -n -h test.invalid --tick 1
+    start_awkred -n --mqtt -h test.invalid --tick 1
     sleep 2.5
     finish_awkred TERM
     rc=$?
@@ -236,7 +258,7 @@ case_sigterm() {
 case_sigint() {
     CASE="Ctrl-C stops everything and exits 0"
     timeout --preserve-status --signal=INT --kill-after=3 3 \
-        "$AWKRED" -n -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
+        "$AWKRED" -n --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
     local rc=$?
     case $rc in
     0) ;;
@@ -250,7 +272,7 @@ case_sigint() {
 case_signal_without_tick() {
     CASE="a plain SIGTERM during a normal run exits 0"
     local rc
-    start_awkred -n -h test.invalid
+    start_awkred -n --mqtt -h test.invalid
     sleep 1.5
     finish_awkred TERM
     rc=$?
@@ -267,7 +289,7 @@ case_buffering() {
     CASE="messages are not stuck in a buffer (stdbuf wiring)"
     export FAKE_SUB_MODE=buffered FAKE_SUB_COUNT=3
     export FAKE_SUB_TOPIC=home/door FAKE_SUB_PAYLOAD=open
-    start_awkred -n -q -h test.invalid
+    start_awkred -n -q --mqtt -h test.invalid
     unset FAKE_SUB_MODE FAKE_SUB_COUNT FAKE_SUB_TOPIC FAKE_SUB_PAYLOAD
     sleep 2
     local lines
@@ -281,7 +303,7 @@ case_buffering() {
 case_stream_routes() {
     CASE="a live stream reaches the rules"
     FAKE_SUB_MODE=stream FAKE_SUB_COUNT=3 \
-        timeout 8 "$AWKRED" -n -v -h test.invalid >"$OUT" 2>"$ERR"
+        timeout 8 "$AWKRED" -n -v --mqtt -h test.invalid >"$OUT" 2>"$ERR"
     local lines
     lines=$(grep -c 'route home/kitchen/temp' "$ERR")
     (( lines == 3 )) || bad "$lines of 3 messages routed, stderr: $(cat "$ERR")"
@@ -316,6 +338,20 @@ case_validation() {
     "$AWKRED" -P 9 -i examples/messages.log >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 2 )) || bad "-P with -i gave exit $rc"
+    "$AWKRED" --mqtt -i examples/messages.log >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "--mqtt with -i gave exit $rc"
+    pass "$CASE"
+}
+
+case_no_input() {
+    CASE="running with no input source is a usage error"
+    local rc
+    "$AWKRED" -n >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "no-input run gave exit $rc"
+    grep -qF 'no input source' "$ERR" || bad "message missing: $(cat "$ERR")"
+    grep -qF -- '--tick' "$ERR" || bad "message does not say how to start: $(cat "$ERR")"
     pass "$CASE"
 }
 
@@ -323,7 +359,7 @@ case_help_and_version() {
     CASE="help lists both forms of every paired flag"
     "$AWKRED" --help >"$OUT" 2>&1 || bad "help exited $?"
     local flag
-    for flag in -n --dry-run -h --host -i --input -r --rules --tick; do
+    for flag in -n --dry-run -h --host -i --input -r --rules --tick --mqtt; do
         grep -qF -- "$flag" "$OUT" || bad "help does not mention $flag"
     done
     "$AWKRED" --version >/dev/null 2>&1 || bad "--version exited $?"
@@ -343,7 +379,8 @@ case_http_routes() {
     CASE="http requests become MQTT-style lines and rules route them"
     local rc rc_msg rc_prec port
     port=$((20000 + RANDOM % 10000))
-    start_awkred -n -v --http-port "$port" -r test/rules -h test.invalid
+    # An http-only run: -h is a broker setting, never an input of its own.
+    start_awkred -n -v --http-port "$port" -r test/rules
     sleep 1.2
     http_get "$port" "/hook/x?p=HOOKPAYLOAD"
     rc=$?
@@ -372,8 +409,24 @@ case_http_port_taken() {
     # long as it blocks in accept(). Keeps the suite bash+coreutils+gawk only.
     timeout 30 gawk -v PORT="$port" 'BEGIN { s = "/inet/tcp/" PORT "/0/0"; r = (s |& getline l) }' </dev/null &
     local occup=$!
-    sleep 0.6
-    "$AWKRED" -n -q --http-port "$port" >/dev/null 2>"$ERR"
+    # gawk binds on first use of the /inet/tcp file and then blocks in accept()
+    # for as long as it is held. Wait for the listen to appear in /proc/net/tcp
+    # - a connect would consume that one accept() and release the port, letting
+    # awk-red's preflight "win" and the run hang instead of failing fast.
+    local hex
+    hex=$(printf '%04X' "$port")
+    listening() { grep -q ":${hex} 00000000:0000 0A " /proc/net/tcp 2>/dev/null; }
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        listening && break
+        sleep 0.1
+    done
+    if ! listening; then
+        kill $occup 2>/dev/null; wait $occup 2>/dev/null
+        bad "port $port never became busy"
+    fi
+    # The preflight must fail fast and exit 1. If anything makes awk-red go
+    # live instead, timeout keeps the suite from hanging forever on it.
+    timeout 15 "$AWKRED" -n -q --http-port "$port" >/dev/null 2>"$ERR"
     rc=$?
     kill $occup 2>/dev/null; wait $occup 2>/dev/null
     (( rc == 1 )) || bad "exit $rc (expected 1), stderr: $(cat "$ERR")"
@@ -386,7 +439,7 @@ case_http_deny() {
     CASE="http with refused subscription exits 5 without hang"
     local rc port
     port=$((22000 + RANDOM % 10000))
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --http-port "$port" -h test.invalid >/dev/null 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt --http-port "$port" -h test.invalid >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means hung), stderr: $(cat "$ERR")"
     assert_no_strays
@@ -397,7 +450,7 @@ case_http_sigterm() {
     CASE="http listener stops cleanly on SIGTERM"
     local rc port
     port=$((23000 + RANDOM % 10000))
-    start_awkred -n --http-port "$port" -h test.invalid
+    start_awkred -n --http-port "$port"
     sleep 1.0
     finish_awkred TERM
     rc=$?
@@ -410,6 +463,46 @@ case_list_rules() {
     "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^awk-red/tick(/|$)' "$OUT" || bad "no heartbeat rule listed"
     grep -qF '4 rule(s), 1 adapter(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The clock must be a complete run by itself: no broker contacted, no banner
+# line about one, and a clean exit on SIGTERM.
+case_tick_only() {
+    CASE="the clock alone runs with no broker input"
+    local rc ticks
+    start_awkred -n -v --tick 1
+    sleep 2.5
+    ticks=$(grep -c '^DRYRUN> ' "$OUT")
+    (( ticks >= 2 )) || bad "only $ticks ticks in 2.5 s"
+    grep -qF 'route awk-red/tick/' "$ERR" || bad "tick not routed: $(cat "$ERR")"
+    grep -qF 'broker' "$ERR" && bad "the banner mentions a broker without --mqtt"
+    finish_awkred TERM
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+# A listener that dies on its own ends the run with its status and says so,
+# instead of hanging forever on a fifo nobody will write to again.
+case_http_death() {
+    CASE="a killed http listener ends the run with its status"
+    local rc port listener
+    port=$((24000 + RANDOM % 10000))
+    start_awkred -n --http-port "$port"
+    sleep 1.0
+    listener=$(pgrep -g "$RUN_PID" -f 'lib/http\.awk' | head -n 1)
+    if [[ -z $listener ]]; then
+        bad "no listener process found"
+    else
+        kill -KILL "$listener" 2>/dev/null || true
+    fi
+    wait_awkred
+    rc=$?
+    (( rc == 137 )) || bad "exit $rc (expected 137), stderr: $(cat "$ERR")"
+    grep -qF 'http listener exited with status 137' "$ERR" || bad "stderr: $(cat "$ERR")"
+    assert_no_strays
     pass "$CASE"
 }
 
@@ -429,8 +522,11 @@ cases=(
     case_buffering
     case_stream_routes
     case_validation
+    case_no_input
     case_help_and_version
     case_list_rules
+    case_tick_only
+    case_http_death
     case_http_off_by_default
     case_http_routes
     case_http_port_taken

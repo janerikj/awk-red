@@ -13,7 +13,7 @@ failed` and the failing case named.
 
 | File | Purpose |
 | --- | --- |
-| `run.sh` | the suite: replay, clock, failure paths, signals, buffering, HTTP |
+| `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP |
 | `fake-mosquitto-sub` | a stand-in subscriber whose behaviour comes from the environment |
 | `rules/webhook.awk` | the rule the HTTP cases route through |
 | `expected/messages.log.out` | golden output for the replay case |
@@ -21,6 +21,11 @@ failed` and the failing case named.
 `awk-red` reads `MOSQ_SUB` from the environment, which is what lets the suite
 replace the subscriber. Nothing else about the run is faked: the real `awk-red`
 binary, the real engine, the real example rules and a real fifo are all used.
+
+Inputs are opt-in (`--mqtt`, `--http-port`, `--tick`, `-i`), so every case
+names the ones it wants and only those. To keep a developer's `.env` out of
+that decision the suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0` and
+`AWKRED_HTTP_PORT=0` before running anything.
 
 ## The fake subscriber
 
@@ -56,10 +61,14 @@ gone.
 
 ## HTTP
 
-Five cases, all offline: `http is off by default`, `http requests become
+Six cases, all offline: `http is off by default`, `http requests become
 MQTT-style lines and rules route them`, `http port already in use fails fast`,
-`http with refused subscription exits 5 without hang` and `http listener stops
-cleanly on SIGTERM`.
+`http with refused subscription exits 5 without hang`, `http listener stops
+cleanly on SIGTERM` and `a killed http listener ends the run with its status`.
+Routing and SIGTERM are http-*only* runs - no `-h`, no `--mqtt` - so they also
+prove the listener can be the whole input; the refused-subscription case keeps
+`--mqtt` on purpose, because it is about what the run does when one of two
+sources fails.
 
 They are written the same way as the rest of the suite - no HTTP library, no
 python:
@@ -75,10 +84,14 @@ python:
   which is exactly the hold we want. The same asymmetry drives the preflight in
   `awk-red`: on a taken port `getline` returns immediately with
   `ERRNO = "Address already in use"`, on a free one it blocks, and `timeout`
-  tells them apart.
-* **No hangs.** Every case that starts a run goes through `timeout`, so a
-  listener that outlives its subscription is reported as exit 124 instead of
-  stalling the suite.
+  tells them apart. The case waits for the listen to appear in `/proc/net/tcp`
+  first - a probe that *connects* would consume the occupier's one `accept()`
+  and release the port - and runs awk-red under `timeout`, so anything other
+  than a fast preflight failure shows up as an exit status instead of a stall.
+* **No hangs.** A foreground run goes through `timeout`, and a background run is
+  waited on with a bound (`finish_awkred`, `wait_awkred`), so a source that
+  outlives its input is reported - usually as exit 124 or "still running after
+  5 s" - instead of stalling the suite.
 
 ## Leftovers are a failure
 
