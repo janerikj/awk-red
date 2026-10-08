@@ -155,10 +155,10 @@ serialisation - `key=value` pairs, say - breaks the plain publishers and ties
 every rule to that choice. The principle instead: **rules match on topic and
 fields, and the payload format is hidden per topic.**
 
-**Variant 1, per-topic adapter (implemented).** The engine keeps a table of
+**Variant 1, per-topic `json()` (implemented).** The engine keeps a table of
 topic pattern to `jq` filter. The payload is passed through `jq` and the rule
 sees the extracted value, so plain and JSON topics share one handler
-implementation. The coprocess is persistent, one per adapter, and started on
+implementation. The coprocess is persistent, one per filter, and started on
 first use.
 
 **Variant 2, parse in AWK (documented, not implemented).** Leave the payload
@@ -171,28 +171,92 @@ cost is a third-party parser to maintain, and rules end up mixing `$2` and
 code stays identical for both formats. Deeply nested or varying schemas, or a
 host without `jq` -> variant 2.
 
-Adapter footguns, all of them hit during development:
+`json()` footguns, all of them hit during development:
 
-* The filter must yield **exactly one line per message**. `head -n 1` drops
-  extras, and a filter that yields nothing desyncs every later message.
+* The filter must yield **exactly one line per message**, and nothing enforces
+  it: the engine reads one line and moves on. The first version piped the
+  coprocess through `head -n 1` to drop extras; head exits after its first
+  line, jq dies of EPIPE writing its second, and the extraction alternates
+  between working and warning. Extras left in the pipe desync every later
+  message instead, which is why the contract is worth stating plainly.
 * Both sides must flush per message, `fflush(cmd)` in the engine and
   `--unbuffered` on `jq`, or the pair deadlocks on a full buffer.
 * **Draining the coprocess deadlocks.** After reading the value, waiting for
   EOF means waiting for `jq` to exit, which it never does while its stdin is
   open. Read exactly one line instead.
 * A missing `jq` makes gawk's coprocess start fail fatally, taking the router
-  with it, so the engine checks for `jq` before registering an adapter.
+  with it, so the engine checks for `jq` before registering a `json()` filter.
 * Filters go through a shell, so a filter containing a single quote is
   rejected rather than quoted into something surprising.
 
+## Payload smoothing (built in v0.4.0)
+
+`smooth(pattern, factor)` replaces every numeric payload on a matching topic
+with an exponential moving average, `new = factor * current + (1 - factor) *
+last`, state kept per exact topic. Five choices worth recording:
+
+* **In the engine, not in a rule.** A rule handler can write the same three
+  lines of EMA, and AWK globals are shared between rule files, so this is not
+  about reach - it is about position. Rules run after the limiter, so a
+  rule-side average would see only the messages that passed it, and the
+  limiter is exactly what a jittery topic is likely to have. The engine can
+  average before the drop. One state per topic also means every rule on the
+  topic reads the same average instead of each keeping its own.
+* **The rule publishes.** Smoothing only rewrites the payload, the way
+  `json()` does; the engine never initiates an MQTT publish. The derived
+  stream's name - `<topic>/filtered`, say - belongs to the rule that
+  publishes it, because topic shaping is left to rules everywhere else (see
+  *Side effects belong to the engine*, and the tick input, where the engine
+  provides the data and `heartbeat.awk` decides to publish it).
+* **`json()`, smoother, limiter.** JSON must become a number before it can be
+  averaged, and the average needs every sample, so the limiter sits last of
+  the three: it gates the rules, not the state. The price is that a dropped
+  message on a JSON topic has paid a `jq` round-trip - accepted, because
+  jq runs as a persistent coprocess and a current average is worth more than
+  saving one round-trip on a message nothing will see anyway.
+* **Fail open on a non-number.** A payload that is not numeric passes through
+  untouched and does not move the state; converting it to zero would silently
+  drag the average down on any topic that also carries words. The same
+  fail-open shape as `json()` without jq or a bad limit window.
+* **First match, per exact topic, factor in (0..1].** By now the shape of all
+  three tables: one registration table, first pattern wins, state keyed by
+  pattern index and topic, a bad argument warns and registers nothing.
+
+## Rate limiting (built in v0.4.0)
+
+`limit(pattern, seconds)` allows one message per matching topic per window and
+drops the rest. Two choices worth recording:
+
+* **Drop, not delay.** The message is discarded after the payload is
+  normalised and averaged but before any rule runs. Delivering it later would
+  want a timer, and gawk has none - see
+  *The clock lives in the shell*: a handler that waits blocks every message
+  behind it, so a trailing debounce cannot be built in the engine at all. The
+  cost falls on rules with edge state, because a dropped message reaches no
+  rule: "reset on close" can miss the change that arrived inside the window.
+  That trade belongs to the rule author, which is why limits are opt-in per
+  pattern. Smoothing is unaffected: the average saw the message before the
+  limiter did.
+* **First match, per exact topic** - the `json()` contract. The window is
+  keyed by pattern index and topic, so `^home/sensor/.*$` gives every sensor a
+  window of its own and overlapping patterns never share state. A bad window
+  warns and registers no limit, the way `json()` without `jq` does: fail
+  open, never a silent one-message-per-lifetime trap.
+
+Windows are measured in whole `systime()` seconds; no case has needed finer.
+Real time is also the wrong clock for the tests: expiry would
+mean sleeping, and a burst straddles a second boundary now and then. So the
+engine clock has a seam - `AWKRED_TEST_STEP`, which starts at the real time
+and advances every check by that many seconds. Step 0 (or unset) means a burst
+yields exactly one survivor, step equal to the window means every message
+crosses it, and neither can flake. Like `MOSQ_SUB` it is a tool path rather
+than configuration, so it stays out of `.env.example`.
+
 ## Buffering between stages
 
-This is the single most common way an awk-red-like setup appears broken.
-
-libc block-buffers stdout when the destination is a pipe or a file: 4-8 KB at
-a time. A terminal is line buffered, which is why manual testing always looks
-correct while a pipe, a service or a log file stands still. Every stage in the
-chain is affected, including `jq`.
+This is the single most common way an awk-red-like setup appears broken. The
+cause, the fix and the two-command diagnosis are in README under *Buffering
+between stages*; what shaped the code is the rest.
 
 awk-red uses `stdbuf -oL` on **both** stages:
 
@@ -201,19 +265,9 @@ stdbuf -oL mosquitto_sub -v -t '#' &
 stdbuf -oL gawk -f lib/router.awk -f rules/*.awk < "$fifo" &
 ```
 
-`stdbuf` works because both programs use libc stdio. The engine additionally
-calls `fflush()` after every message, which is cheap insurance, but it cannot
-help the other stage: `fflush()` inside AWK only touches AWK's own stdout. If
-mosquitto_sub is buffering, the fix has to be on the reading side of the
-pipe. Programs that buffer themselves need their own flag instead -
-`jq --unbuffered`, which awk-red passes.
-
-To find out which stage is at fault:
-
-```shell
-mosquitto_sub -v -t '#' | cat                                    # buffered? sub is
-stdbuf -oL mosquitto_sub -v -t '#' | awk '{print; fflush("")}'   # still stuck? awk is
-```
+`stdbuf` works because both programs use libc stdio. Programs that buffer
+themselves need their own flag instead - `jq --unbuffered`, which awk-red
+passes.
 
 Worth knowing while testing this: gawk flushes its output before it reads a
 record, so a program that prints and then blocks on *input* looks line buffered
@@ -425,8 +479,9 @@ Four traps the tests had to avoid, each of which cost time:
 * **A developer's `.env` reaches every case.** Since inputs are opt-in, an
   `AWKRED_MQTT=1` (or `--mqtt` baked into a shell alias) in the environment
   would quietly subscribe in cases that exist to prove no subscription happens.
-  The suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0` and `AWKRED_HTTP_PORT=0`
-  before running anything, so each case names its own inputs and only its own.
+  The suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0`, `AWKRED_HTTP_PORT=0` and
+  `AWKRED_TEST_STEP=0` before running anything, so each case names its own
+  inputs, and its own clock, and only its own.
 
 The suite is worth what its failures are worth, so each guarantee was checked by
 breaking it on purpose: removing `stdbuf -oL` fails the buffering case, removing
@@ -438,7 +493,7 @@ the clock's trap fails two cases, and the leftover check is what caught the
 * **`@include` lists in a `main.awk`** - a file to maintain, and the glob
   variants do not work. Replaced by flag-driven assembly.
 * **Normalising every payload to `key=value`** - breaks plain publishers and
-  binds rules to one serialisation. Replaced by per-topic adapters.
+  binds rules to one serialisation. Replaced by per-topic `json()` extraction.
 * **gawk as a single program including everything** - no room for `.env`,
   dependency checks or process supervision.
 * **A JSON parser in AWK as the default** - more robust, but it makes every
@@ -493,11 +548,11 @@ Two costs, both accepted deliberately:
   for ever with the ticker running. `wait -n` is the fix precisely because it
   *reaps*: once the finished child is gone, `kill -0` sorts the dead one from
   the survivors without reading `/proc` or timing anything.
-* **Feedback.** With `-t '#'` the router receives its own published messages.
-  A rule that publishes to the topic it matches re-triggers itself once per
-  interval, so `awk-red/tick/` is write-once by contract and heartbeat output
-  goes to `awk-red/heartbeat/`. The contract is documented where the rule is
-  written, in `examples/heartbeat.awk`.
+* **Feedback.** With `-t '#'` the router receives its own published messages,
+  so a rule that publishes to the topic it matches re-triggers itself. The
+  write-once contract this forces on `awk-red/tick/` is stated in README under
+  *Scheduled work*; heartbeat output goes to `awk-red/heartbeat/`, as
+  `examples/heartbeat.awk` shows.
 
 Exit status follows from the same split: a source that failed on its own is
 reported with its own status under its own name so systemd restarts the
@@ -665,8 +720,6 @@ Roughly in order of value per effort:
   of a log, as topics; `inotifywait` when present, polling otherwise.
 * **A UDP listener** (`--udp-port`) beside the HTTP one, for syslog, StatsD and
   one-line senders.
-* **Rate limiting / debounce** with `systime()`: at most one alarm per sensor
-  per interval, independent of the state logic each rule writes today.
 * **State persistence**: dump selected variables on `END`, reload in `BEGIN`,
   so a restart does not re-alarm on stale values.
 * **A test runner**: replay a directory of recordings and diff against

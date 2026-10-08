@@ -16,7 +16,7 @@ rules work out of the box and double as a starting point for your own.
 | --- | --- |
 | `temp.awk` | state between messages: alerts on the rising edge, not on every reading |
 | `door.awk` | state changes, retained messages, `emit()` for an arbitrary command |
-| `json.awk` | a JSON topic normalised by an adapter, so the handler sees plain text |
+| `json.awk` | a JSON topic extracted by `json()`, so the handler sees plain text |
 | `heartbeat.awk` | scheduled work from the built-in clock, publishing a heartbeat topic |
 | `messages.log` | a recorded `mosquitto_sub -v` stream used by `--input` |
 

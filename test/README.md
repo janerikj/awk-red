@@ -13,19 +13,26 @@ failed` and the failing case named.
 
 | File | Purpose |
 | --- | --- |
-| `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP |
+| `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP, smoothing, rate limits |
 | `fake-mosquitto-sub` | a stand-in subscriber whose behaviour comes from the environment |
 | `rules/webhook.awk` | the rule the HTTP cases route through |
+| `rules/limit.awk` | the rule the rate-limit cases route through |
+| `rules/json.awk` | the rule the JSON extraction and the split recipe cases route through |
+| `rules/smooth.awk` | the rule the smoothing cases route through: JSON-in, and limited where the order matters |
 | `expected/messages.log.out` | golden output for the replay case |
 
 `awk-red` reads `MOSQ_SUB` from the environment, which is what lets the suite
-replace the subscriber. Nothing else about the run is faked: the real `awk-red`
-binary, the real engine, the real example rules and a real fifo are all used.
+replace the subscriber; the engine reads `AWKRED_TEST_STEP`, which steps its
+clock so a window can be crossed without sleeping - that is how the rate-limit
+expiry case, and the smoothing-runs-before-the-limiter case, stay deterministic.
+Nothing else
+about the run is faked: the real `awk-red` binary, the real engine, the real
+example rules and a real fifo are all used.
 
 Inputs are opt-in (`--mqtt`, `--http-port`, `--tick`, `-i`), so every case
 names the ones it wants and only those. To keep a developer's `.env` out of
-that decision the suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0` and
-`AWKRED_HTTP_PORT=0` before running anything.
+that decision the suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0`,
+`AWKRED_HTTP_PORT=0` and `AWKRED_TEST_STEP=0` before running anything.
 
 ## The fake subscriber
 

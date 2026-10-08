@@ -25,6 +25,9 @@ export MOSQ_SUB="$PWD/test/fake-mosquitto-sub"
 # Inputs are opt-in and each case names the ones it wants: a developer's .env
 # must not switch one on (or off) behind the suite's back.
 export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=0
+# The rate-limit test seam, pinned like the inputs: a value in a developer's
+# .env must not move a window behind the suite's back.
+export AWKRED_TEST_STEP=0
 AWKRED="$PWD/awk-red"
 FILTER=${1:-${FILTER:-}}   # ./test/run.sh [case-substring]
 CASE=""
@@ -462,7 +465,176 @@ case_list_rules() {
     CASE="every example rule is discovered"
     "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^awk-red/tick(/|$)' "$OUT" || bad "no heartbeat rule listed"
-    grep -qF '4 rule(s), 1 adapter(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    grep -qF '4 rule(s), 1 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# Rate limits are kept per exact topic: noise/x is dropped inside its window
+# while noise/y, which has a window of its own, still gets through. The first
+# message on a topic always passes, so this case needs no fake clock.
+case_limit_drop() {
+    CASE="a rate-limited topic drops messages inside its window"
+    local rc
+    printf 'noise/x 1\nnoise/x 2\nnoise/y 1\nnoise/x 3\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    [[ $(grep -c '^DRYRUN> echo limited ' "$OUT") == 2 ]] \
+        || bad "expected 2 surviving messages, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo limited 'noise/x 1'" "$OUT" \
+        || bad "the first noise/x was dropped: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo limited 'noise/y 1'" "$OUT" \
+        || bad "noise/y does not have its own window: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo limited 'noise/x 3'" "$OUT" \
+        && bad "noise/x passed a message inside its window: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# Expiry must not be waited for on real time, and a burst on the real clock can
+# straddle a second boundary, so the engine's clock can step: AWKRED_TEST_STEP=60
+# advances one 60 s window per check, which is what makes this deterministic.
+case_limit_expiry() {
+    CASE="messages flow again once the limit window has passed"
+    local rc
+    printf 'noise/x 1\nnoise/x 2\nnoise/x 3\n' \
+        | AWKRED_TEST_STEP=60 "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    [[ $(grep -c '^DRYRUN> echo limited ' "$OUT") == 3 ]] \
+        || bad "expected all 3 messages after the window, got: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_limit_lists() {
+    CASE="a registered limit is listed by --list-rules"
+    "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF 'limit   ^noise/' "$OUT" || bad "no limit row: $(cat "$OUT")"
+    grep -qF '2 limit(s)' "$OUT" || bad "summary has no limit count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_smooth_lists() {
+    CASE="a registered smoother is listed by --list-rules"
+    "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF 'smooth  ^smooth/' "$OUT" || bad "no smooth row: $(cat "$OUT")"
+    grep -qF '2 smooth(s)' "$OUT" || bad "summary has no smooth count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The json() coprocess is persistent: several messages in a row must all be
+# extracted, not just the first. The `head -n 1` that used to guard the pipe
+# exited after one line and killed jq with EPIPE - see design.md.
+case_json_stream() {
+    CASE="a json() extraction keeps working across a stream of messages"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 'json/a {"temperature": 100}\njson/a {"temperature": 200}\njson/a {"temperature": 300}\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo extracted '100'" "$OUT" \
+        || bad "first message not extracted: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo extracted '200'" "$OUT" \
+        || bad "second message not extracted: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo extracted '300'" "$OUT" \
+        || bad "third message not extracted: $(cat "$OUT")"
+    grep -qF 'warning' "$ERR" && bad "the json() filter warned: $(cat "$ERR")"
+    pass "$CASE"
+}
+
+# The README recipe: one JSON message, both fields on one line, and the rule
+# publishes each field to its own topic - two messages from one input.
+case_split_recipe() {
+    CASE="one JSON message becomes a publish per field"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 'split/s {"temperature": 21.5, "humidity": 41}\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> mosquitto_pub " "$OUT" \
+        || bad "nothing was published: $(cat "$OUT")"
+    grep -qF -- "-t 'split/s/temperature' -m '21.5'" "$OUT" \
+        || bad "no temperature topic: $(cat "$OUT")"
+    grep -qF -- "-t 'split/s/humidity' -m '41'" "$OUT" \
+        || bad "no humidity topic: $(cat "$OUT")"
+    [[ $(grep -c '^DRYRUN> mosquitto_pub ' "$OUT") == 2 ]] \
+        || bad "expected exactly 2 publishes: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The pipeline is json(), smoother, limiter: a JSON payload must be
+# extracted before it can be averaged, so the average is over the numbers.
+case_smooth_after_json() {
+    CASE="a JSON payload is extracted before it is smoothed"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 'smooth/json {"temperature": 100}\nsmooth/json {"temperature": 0}\nsmooth/json {"temperature": 0}\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/json 100'" "$OUT" \
+        || bad "the first value was not extracted: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/json 50'" "$OUT" \
+        || bad "the second value was not averaged: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/json 25'" "$OUT" \
+        || bad "the third value was not averaged: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# An average carries one state value per exact topic: it starts from the first
+# message, moves by the factor per message, and a payload that is not a number
+# passes through untouched - it must not drag the average toward zero.
+case_smooth_ema() {
+    CASE="a smoothed topic averages with the factor, per topic"
+    local rc
+    printf 'smooth/x 100\nsmooth/x 0\nsmooth/x 0\nsmooth/y 7\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/x 100'" "$OUT" \
+        || bad "the first message did not seed the state: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/x 50'" "$OUT" \
+        || bad "the second message was not averaged: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/x 25'" "$OUT" \
+        || bad "the third message was not averaged: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/y 7'" "$OUT" \
+        || bad "smooth/y does not have state of its own: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_smooth_nonnumeric() {
+    CASE="a non-numeric payload passes through and leaves the state alone"
+    local rc
+    printf 'smooth/x 100\nsmooth/x open\nsmooth/x 0\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/x open'" "$OUT" \
+        || bad "the word was not passed through: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'smooth/x 50'" "$OUT" \
+        || bad "the state moved on a non-number: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# Smoothing runs before the limiter, so the average sees the messages the
+# limiter drops: 100 seeds, the dropped 0 still moves the state to 50, and the
+# next message through the open window carries 25. A smoother on the far side
+# of the limiter would miss the dropped 0 and emit 50. AWKRED_TEST_STEP=40
+# walks the 60 s window: t, t+40 (inside), t+80 (expired), no sleeping.
+case_smooth_before_limit() {
+    CASE="the smoother sees the messages the limiter drops"
+    local rc
+    printf 'throttle/x 100\nthrottle/x 0\nthrottle/x 0\n' \
+        | AWKRED_TEST_STEP=40 "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo smoothed 'throttle/x 100'" "$OUT" \
+        || bad "the first message did not get through: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo smoothed 'throttle/x 25'" "$OUT" \
+        || bad "the state did not include the dropped message: $(cat "$OUT")"
+    [[ $(grep -c '^DRYRUN> echo smoothed ' "$OUT") == 2 ]] \
+        || bad "expected exactly 2 messages through the window: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -525,6 +697,16 @@ cases=(
     case_no_input
     case_help_and_version
     case_list_rules
+    case_limit_drop
+    case_limit_expiry
+    case_limit_lists
+    case_smooth_lists
+    case_smooth_ema
+    case_smooth_nonnumeric
+    case_smooth_before_limit
+    case_json_stream
+    case_split_recipe
+    case_smooth_after_json
     case_tick_only
     case_http_death
     case_http_off_by_default
