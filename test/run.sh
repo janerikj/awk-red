@@ -465,7 +465,7 @@ case_list_rules() {
     CASE="every example rule is discovered"
     "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^awk-red/tick(/|$)' "$OUT" || bad "no heartbeat rule listed"
-    grep -qF '4 rule(s), 1 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    grep -qF '7 rule(s), 2 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -560,6 +560,58 @@ case_split_recipe() {
         || bad "no humidity topic: $(cat "$OUT")"
     [[ $(grep -c '^DRYRUN> mosquitto_pub ' "$OUT") == 2 ]] \
         || bad "expected exactly 2 publishes: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# chain() keeps the event in the process: the chained rules run with no broker
+# at all, and only the eventual emit() is visible. A payload that triggered no
+# rule looks like a broken test, so both fields have a handler.
+case_chain_inprocess() {
+    CASE="chain() routes an internal event with no broker"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 'chain/split {"temperature": 21, "humidity": 40}\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo chained-temp '21'" "$OUT" \
+        || bad "the chained temperature rule did not run: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo chained-hum '40'" "$OUT" \
+        || bad "the chained humidity rule did not run: $(cat "$OUT")"
+    [[ $(grep -c '^DRYRUN> ' "$OUT") == 2 ]] \
+        || bad "expected exactly 2 chained echoes, got: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# A chained event is fed through the whole pipeline, not routed raw: JSON text
+# queued to a topic that has a json() filter of its own must still be
+# extracted. The source rule chains JSON, the target decodes it.
+case_chain_pipeline() {
+    CASE="a chained event re-enters the json() pipeline"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 'chain/numsrc 7\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo chained-num '7'" "$OUT" \
+        || bad "the chained JSON was not extracted: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# A chain that keeps matching its own topic must be cut off, not spun. The
+# guard drops the event once it exceeds AWKRED_CHAIN_MAX and warns; without it
+# the run would never end.
+case_chain_loop_guard() {
+    CASE="a self-matching chain is cut off, not spun"
+    local rc
+    printf 'chain/loop x\n' \
+        | AWKRED_CHAIN_MAX=4 timeout 15 "$AWKRED" -n -q -r test/rules -i - \
+            >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc (124 means it spun), stderr: $(cat "$ERR")"
+    grep -qF 'chain depth 5 exceeds 4' "$ERR" \
+        || bad "no hop-guard warning: $(cat "$ERR")"
     pass "$CASE"
 }
 
@@ -706,6 +758,9 @@ cases=(
     case_smooth_before_limit
     case_json_stream
     case_split_recipe
+    case_chain_inprocess
+    case_chain_pipeline
+    case_chain_loop_guard
     case_smooth_after_json
     case_tick_only
     case_http_death

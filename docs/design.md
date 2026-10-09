@@ -252,6 +252,51 @@ yields exactly one survivor, step equal to the window means every message
 crosses it, and neither can flake. Like `MOSQ_SUB` it is a tool path rather
 than configuration, so it stays out of `.env.example`.
 
+## Chaining rules (built in v0.5.0)
+
+`chain(topic, payload)` links rules in-process. A handler queues an event and
+the engine routes it after the current message, through the same
+`json()`/`smooth()`/`limit()` pipeline. The alternative is what rules did
+before: `pub()` to a new topic and let the subscription echo it back.
+
+The first design was to have the engine write the event into its own input fifo,
+which is literally "keep it in the application" and needs no new engine state.
+It was dropped after looking at the fifo's two jobs:
+
+* **The fifo is where EOF lives.** The engine sees end of input when the writer
+  closes the fifo, and that is how a dead subscription ends the run. An engine
+  holding a write end open on its own input never sees EOF, so `awk-red`'s
+  `wait` on the engine would hang. Open and close per message would work, but it
+  puts the shutdown path at the mercy of a race.
+* **Replay has no fifo.** `--input` runs gawk directly on the file, which is
+  exactly where chaining is most useful to test. A fifo-write would work live
+  and do nothing under `-i`.
+
+The queue keeps the transport out of the engine, works identically in every
+mode, and reuses the pipeline instead of duplicating it. Four choices worth
+recording:
+
+* **A queue, not a recursive `route()` call.** A handler can already call the
+  engine's own `route()` (functions are global across `-f` files), and an early
+  experiment did. It recurses, so a long chain grows the stack, and it skips
+  `json()`/`smooth()`/`limit()` entirely. The queue is iterative and feeds each
+  event back through the same stages as an external message, so "as if it
+  arrived" is the actual contract. `route()`, `feed()` and `drain()` are
+  therefore engine internals, not rule API: reachable because gawk has no
+  visibility, but only `chain()` is meant to be called from a rule.
+* **Drained after the current message.** All matching handlers for a message
+  run before any chained event, and multiple `chain()` calls keep their order.
+  That is breadth-first; depth-first would need the recursive call above.
+* **A hop guard, because the broker was the rate limit.** A `pub()` feedback
+  loop is slowed by the broker round-trip; an in-process cycle has no such
+  brake and would spin at full CPU. The guard counts hops per event against
+  `AWKRED_CHAIN_MAX` (default 32) and drops with a warning, the same fail-loud
+  shape as a bad `limit()` window.
+* **No new side effect to dry-run.** `chain()` prints nothing under
+  `--dry-run` because it runs no command; the eventual `pub()`/`emit()` at the
+  end of the chain is what dry-run shows. The event itself is visible only with
+  `-v`.
+
 ## Buffering between stages
 
 This is the single most common way an awk-red-like setup appears broken. The
@@ -508,6 +553,10 @@ the clock's trap fails two cases, and the leftover check is what caught the
 * **`mosquitto_pub` for the heartbeat** - it would publish outside the
   subscription filter and race the engine's own messages. A tick line in the
   same fifo keeps the order deterministic.
+* **Writing a chained event into the engine's own input fifo** - no new engine
+  state, but the engine would hold the fifo's write end and never see EOF, and
+  it does nothing under `--input`, which has no fifo. Replaced by the in-engine
+  queue above.
 
 ## The clock lives in the shell, not in AWK
 

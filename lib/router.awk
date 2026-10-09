@@ -7,6 +7,7 @@
 #   * JSON extraction, so rules never care whether a topic is plain or JSON
 #   * payload smoothing, so a jittery numeric topic reaches rules as an EMA
 #   * rate limits, so a noisy topic is dropped before any rule runs
+#   * in-process chaining: chain() queues a message for another rule
 #   * diagnostics: log(), debug(), warn(), error()
 #
 # A rule file only registers a topic pattern and implements a handler:
@@ -243,6 +244,9 @@ function limited(topic,    i, key, now) {
     return 0
 }
 
+# Internal: dispatch one message to every matching handler. Not part of the
+# rule-facing API - a rule hands work to another rule with chain(), never by
+# calling route() itself.
 function route(topic, payload,    i, hits, fn) {
     hits = 0
     for (i = 1; i <= N; i++) {
@@ -258,6 +262,64 @@ function route(topic, payload,    i, hits, fn) {
     if (hits == 0)
         debug("no rule matched " topic)
     return hits
+}
+
+# ------------------------------------------------------------------ chaining
+
+# Internal: one message through the whole pipeline, whether it came from an
+# input or from chain(). JSON first (a JSON topic must yield the number before
+# it can be smoothed), smoothing next (the average needs every sample, including
+# messages the limiter is about to drop), the limiter last (it gates the rules
+# without gatekeeping the state). hops is 0 for an external message and grows by
+# one per chain(). Rules must not call this - it bypasses the queue and the hop
+# guard; use chain() instead.
+function feed(topic, payload, hops) {
+    payload = adapt(topic, payload)
+    payload = smoothed(topic, payload)
+    if (limited(topic)) {
+        DROPPED++
+        debug("limited " topic " (" payload ")")
+        return
+    }
+    MSGS++
+    CUR_HOPS = hops
+    route(topic, payload)
+}
+
+# chain(topic, payload) queues an internal event for routing right after the
+# current message, without publishing it. Unlike pub() the event never leaves
+# the process: no broker, no subscription round-trip, and it works under
+# --input too. It is fed through the same pipeline (json, smooth, limit) as an
+# external message.
+function chain(topic, payload) {
+    CHAIN_N++
+    CHAIN_TOPIC[CHAIN_N] = topic
+    CHAIN_PAYLOAD[CHAIN_N] = payload
+    CHAIN_HOPS[CHAIN_N] = CUR_HOPS + 1
+    debug("chain " CHAIN_HOPS[CHAIN_N] ": " topic " (" payload ")")
+}
+
+# Internal: drain the queue after the current message is fully routed, called
+# only by the main input loop. Iterative, not recursive: a handler may chain
+# more events, which land behind the read pointer and are picked up by the same
+# loop, so a long chain cannot grow the stack. The guard counts hops per event,
+# so a chain that matches itself is cut off instead of spun. Reset the indices
+# once drained so a long run does not accumulate queue state. Rules must not
+# call this; use chain() to queue and let the engine schedule the drain.
+function drain(    t, p, h) {
+    while (CHAIN_READ < CHAIN_N) {
+        CHAIN_READ++
+        t = CHAIN_TOPIC[CHAIN_READ]
+        p = CHAIN_PAYLOAD[CHAIN_READ]
+        h = CHAIN_HOPS[CHAIN_READ]
+        if (h > CHAIN_MAX) {
+            warn("chain depth " h " exceeds " CHAIN_MAX " on " t ", dropped")
+            continue
+        }
+        feed(t, p, h)
+    }
+    CHAIN_READ = 0
+    CHAIN_N = 0
 }
 
 # -------------------------------------------------------------------- setup
@@ -309,6 +371,12 @@ BEGIN {
 
     PUB_CMD = build_pub_cmd()
     CLOCK_STEP = getenv("AWKRED_TEST_STEP", "0") + 0
+    CHAIN_MAX = getenv("AWKRED_CHAIN_MAX", "32") + 0
+    if (CHAIN_MAX < 1)
+        CHAIN_MAX = 32
+    CHAIN_READ = 0
+    CHAIN_N = 0
+    CUR_HOPS = 0
     MSGS = 0
     DROPPED = 0
 }
@@ -319,19 +387,8 @@ BEGIN {
         next
     topic = $1
     payload = substr($0, length(topic) + 2)
-    # json() first: JSON topics must yield the number before it can be
-    # smoothed. Smoothing next: the average needs every sample, including
-    # messages the limiter is about to drop. The limiter runs last of the
-    # three, so it gates the rules without gatekeeping the state.
-    payload = adapt(topic, payload)
-    payload = smoothed(topic, payload)
-    if (limited(topic)) {
-        DROPPED++
-        debug("limited " topic " (" payload ")")
-        next
-    }
-    MSGS++
-    route(topic, payload)
+    feed(topic, payload, 0)
+    drain()
     fflush("")
 }
 

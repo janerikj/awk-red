@@ -13,12 +13,13 @@ failed` and the failing case named.
 
 | File | Purpose |
 | --- | --- |
-| `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP, smoothing, rate limits |
+| `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP, smoothing, rate limits, chaining |
 | `fake-mosquitto-sub` | a stand-in subscriber whose behaviour comes from the environment |
 | `rules/webhook.awk` | the rule the HTTP cases route through |
 | `rules/limit.awk` | the rule the rate-limit cases route through |
 | `rules/json.awk` | the rule the JSON extraction and the split recipe cases route through |
 | `rules/smooth.awk` | the rule the smoothing cases route through: JSON-in, and limited where the order matters |
+| `rules/chain.awk` | the rule the chaining cases route through: split, pipeline re-entry and the hop guard |
 | `expected/messages.log.out` | golden output for the replay case |
 
 `awk-red` reads `MOSQ_SUB` from the environment, which is what lets the suite

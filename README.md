@@ -1,17 +1,18 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.4.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.5.0-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
 
-A Node-RED style event router built on MQTT, `mosquitto_sub` and AWK.
+A Node-RED style event router built on a small AWK engine, with MQTT, HTTP, a
+clock and recordings as the inputs.
 
 Node-RED is built on a handful of simple ideas:
 
-1. subscribe to events (MQTT)
+1. subscribe to events
 2. filter them
 3. transform the data
 4. decide something
-5. call an external program or publish a new MQTT message
+5. call an external program or publish a new message
 
 AWK's `pattern { action }` model covers exactly those steps: pattern matching
 filters, the action body transforms and decides, and `system()` calls out to
@@ -25,13 +26,17 @@ replays a recording. A run needs at least one of them; broker settings (`-h`,
 themselves.
 
 ```
-mosquitto_sub -v -t '#'          HTTP clients              clock (--tick)
-        |                        |  one request per         |
-        |  line buffered         |  connection              |
-        +------------------------+--------------------------+
-                                 v
+--mqtt       mosquitto_sub -v -t '#'   the MQTT subscription
+--http-port  HTTP clients              webhooks
+--tick       the clock                 a message every interval
+-i FILE      a recording               a fixed stream
+
+        every input writes one line per message:  "topic payload"
+                       |
+                       v
 gawk -f lib/router.awk -f <rules>/*.awk     the engine
         |
+        +--> chain()  -> another rule      (in-process, no publish)
         +--> pub()    -> mosquitto_pub    (new MQTT messages)
         +--> emit()   -> any command      (logger, ntfy, curl, scripts)
 ```
@@ -46,6 +51,7 @@ a rule directory, and nothing else.
 | `bash` >= 4.4 | the entry point | ships everywhere |
 | `gawk` >= 4.0 | indirect calls, two-way coprocesses | `sudo apt install gawk` |
 | `mosquitto_sub` | the MQTT subscription, only with `--mqtt` | `sudo apt install mosquitto-clients` |
+| `mosquitto_pub` | the MQTT publisher, only for `pub()` | `sudo apt install mosquitto-clients` |
 | `stdbuf`, `timeout` | line buffering and the HTTP preflight (coreutils) | usually already installed |
 | `jq` | only for `json()` payload extraction | `sudo apt install jq` |
 | `ntfy` | only if a rule emits ntfy notifications | <https://github.com/dschep/ntfy> |
@@ -57,7 +63,7 @@ calls `gawk` explicitly.
 
 ```shell
 git clone <this repo> && cd awk-red
-cp .env.example .env                     # set MQTT_HOST at least
+cp .env.example .env                     # set MQTT_HOST if you use a broker
 ./awk-red -n -i examples/messages.log    # dry run against a recording
 ./awk-red -l                             # what handles what
 ./awk-red -n --tick 1                    # the clock alone, no broker needed
@@ -80,7 +86,7 @@ mosquitto_pub -t home/door -m open
 awk-red              the application: .env, flags, dependencies, rule discovery,
                      line buffering, process supervision
 lib/router.awk       the engine: dispatch table, side effects, JSON extraction,
-                     smoothing, rate limits, logging
+                     smoothing, rate limits, in-process chaining, logging
 examples/            default rule directory (--rules), plus a recorded stream
 docs/design.md       why it is built this way, and what was tried instead
 .env.example         every configuration variable with its default
@@ -117,6 +123,7 @@ never committed.
 | `AWKRED_RULES` | `examples` | rule directory (`-r`) |
 | `AWKRED_FIRST_MATCH` | `0` | stop after the first matching rule |
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
+| `AWKRED_CHAIN_MAX` | `32` | maximum `chain()` hops before an event is dropped |
 | `AWKRED_TICK` | `0` | clock interval in seconds, `0` is off (`--tick`) |
 | `AWKRED_HTTP_PORT` | `0` | listen for HTTP webhooks on this port, `0` is off (`--http-port`) |
 | `AWKRED_ENV` | `./.env` if present | env file to load (`-e`) |
@@ -143,7 +150,7 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -t, --topic FILTER  subscription filter (default '#')
 -r, --rules DIR     rule directory, *.awk loaded in sorted order
 -e, --env FILE      env file to load
--i, --input FILE    read messages from FILE ('-' = stdin) instead of MQTT
+-i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
 -P, --http-port [PORT]  serve HTTP webhooks on PORT (default 8080 if given
@@ -202,6 +209,7 @@ minute" or "only on a state change".
 | `json(pattern, jq_filter)` | normalise a JSON payload before rules see it |
 | `smooth(pattern, factor)` | replace a numeric payload with a moving average before limits and rules |
 | `limit(pattern, seconds)` | drop matching messages to at most one per topic per window |
+| `chain(topic, payload)` | queue an internal event for another rule, no broker involved |
 | `pub(topic, payload)` | publish an MQTT message, using the configured broker |
 | `pub_retained(topic, payload)` | the same, with the retained flag |
 | `emit(command)` | run any command, subject to `--dry-run` |
@@ -221,9 +229,9 @@ system: commands are printed, not executed.
 DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -t 'alarm/temp/kitchen' -m 'hot: 31.2C in kitchen'
 ```
 
-Rules never hardcode a hostname, port or credential. If you need a command
-that is not MQTT, build it with `shquote()` so values with spaces stay one
-argument:
+Rules never hardcode a hostname, port or credential. For anything that is not
+an MQTT publish, build the command with `shquote()` so values with spaces stay
+one argument:
 
 ```awk
 # send a notification via ntfy (topic can vary per rule)
@@ -232,6 +240,85 @@ emit("ntfy publish alerts " shquote("Door opened"))
 # or trigger a webhook
 emit("curl -fsS " shquote("https://example.org/hook?msg=" url))
 ```
+
+## Engine-wide stages
+
+`json()`, `smooth()` and `limit()` are not per-rule. Each registers a
+per-topic stage that the engine runs on every message **before** routing, in
+registration order, first match wins. Three consequences:
+
+* A stage registered in one rule file changes what **every** rule on that topic
+  sees, or whether it sees the message at all - across all rule files, including
+  ones loaded later. `limit()` in particular drops the message before routing,
+  so no handler runs, not just the handler in the registering file.
+* They are set up once, at load time, not called per message. You cannot scope
+  one to a single handler; to gate a single rule, keep the state in that rule.
+* Overlapping patterns do not stack. The first `json()`, `smooth()` or `limit()`
+  that matches wins, and any later one for the same topic is inert.
+
+`--list-rules` shows every registration, which is the quickest way to see what
+is acting on a topic.
+
+## Chaining rules
+
+Two rules are linked when a handler queues a new internal event with
+`chain(topic, payload)`. The queued event is routed right after the current
+message finishes, through the same `json()`/`smooth()`/`limit()` pipeline - but
+it never reaches the broker:
+
+```awk
+# rules/chain.awk
+
+# stage 1: fan a combined reading out into internal events
+BEGIN {
+    json("^home/reading$", "[.temperature, .humidity] | @tsv")
+    reg("^home/reading$", "reading_split", "chain each field to its own topic")
+}
+
+function reading_split(topic, payload,    f) {
+    split(payload, f, "\t")
+    chain("home/reading/temperature", f[1])
+    chain("home/reading/humidity", f[2])
+}
+
+# stage 2: ordinary rules handle the chained events
+BEGIN { reg("^home/reading/temperature$", "reading_temp", "alert on chained temperature") }
+
+function reading_temp(topic, payload) {
+    if (payload + 0 > 30)
+        pub("alarm/reading", "hot: " payload)
+}
+
+# home/reading/humidity needs a rule of its own, or the event is discarded
+BEGIN { reg("^home/reading/humidity$", "reading_humidity", "alert on chained humidity") }
+
+function reading_humidity(topic, payload) {
+    if (payload + 0 > 60)
+        pub("alarm/reading", "humid: " payload)
+}
+```
+
+`chain()` takes the same two string arguments as `pub()`. The difference is
+where the event goes: `pub()` leaves the process for the broker, `chain()` stays
+inside on the same stream as any other message. Because nothing leaves, chaining
+works in every mode - including `-i` replay, where there is no broker at all -
+and the chained rule runs in a defined order instead of whenever the broker
+echoes the message back. `examples/chain.awk` is this pattern as a working file.
+
+Three things to know:
+
+* **A chained topic still needs a rule.** There is no broker and no retained
+  copy to fall back on: if no `reg()` matches the chained topic, the event is
+  discarded (logged as `no rule matched` with `-v`). Chain when the next step is
+  another rule; publish when it has to leave the process.
+* **Chained events re-enter the pipeline.** They are normalised, smoothed and
+  rate-limited exactly like an external message, so a `json()` filter on the
+  chained topic runs on the payload the rule queued. Send the format that topic
+  expects.
+* **A chain that matches itself is cut off.** The guard is a hop count,
+  `AWKRED_CHAIN_MAX` (default 32); an event past it is dropped with a warning.
+  Without it a self-matching chain would spin forever - the same feedback loop
+  `pub()` has, but with no broker round-trip to slow it down.
 
 ## Payload formats
 
@@ -347,7 +434,10 @@ BEGIN {
 The window is kept per exact topic, so a pattern over a prefix gives every
 topic under it a window of its own. The first matching `limit()` wins, the
 same way the first matching `json()` does, and `--list-rules` shows what is
-limited. A dropped message is logged with `-v`.
+limited. A dropped message is logged with `-v`. The limit is engine-wide, like
+`json()` and `smooth()`: the drop happens before routing, so it gates every
+rule on the topic, not only the rule whose file registered it (see
+*Engine-wide stages*).
 
 Dropping instead of delaying has a price worth knowing: a dropped message
 reaches no rule at all, so a rule that keeps state - alert once, reset on
@@ -356,16 +446,15 @@ limit only where that trade is worth it.
 
 ## HTTP webhooks
 
-Rules can be driven over plain HTTP as well as MQTT. It is off unless asked
-for: `--http-port PORT` or `AWKRED_HTTP_PORT`, where `-P` on its own means
-8080. HTTP can be the whole input: `./awk-red -n --http-port 8080` needs no
-broker subscription at all (`pub()` in a rule still uses the configured broker
-for what it sends). The listener binds all interfaces (there is no host
-option), so treat it like any other port you expose and firewall it
-accordingly.
+HTTP is another input a rule can react to, off unless asked for:
+`--http-port PORT` or `AWKRED_HTTP_PORT`, where `-P` on its own means
+8080. It can be the whole input: `./awk-red -n --http-port 8080` needs no
+subscription at all (`pub()` in a rule still sends to the configured broker).
+The listener binds all interfaces (there is no host option), so treat it like
+any other port you expose and firewall it accordingly.
 
-A request becomes one line of engine input, exactly as a broker would deliver
-it:
+A request becomes one line of engine input, exactly as any other source
+delivers one:
 
 ```text
 POST /door/front?p=open        ->  post/door/front open
@@ -449,7 +538,7 @@ what `stdbuf -oL` does.
 
 ## Replaying a recorded stream
 
-`--input` replaces the broker with a file, which makes rules testable and
+`--input` replaces the live inputs with a file, which makes rules testable and
 reproducible:
 
 ```shell
@@ -459,15 +548,15 @@ mosquitto_sub -v -t '#' | tee recording.log   # record a real stream
 ./awk-red -n -i recording.log                 # replay it
 ```
 
-A recording is exactly what `mosquitto_sub -v` prints: `topic payload`, one
-line per message. Two caveats: a payload that itself contains newlines
-arrives as several lines, and a multi-line payload cannot be replayed
-faithfully without extra framing.
+A recording is one `topic payload` line per message - the format every input
+produces, and exactly what `mosquitto_sub -v` prints. Two caveats: a payload
+that itself contains newlines arrives as several lines, and a multi-line
+payload cannot be replayed faithfully without extra framing.
 
 ## Scheduled work
 
-Rules normally react to broker traffic, which means they cannot fire while the
-broker is quiet. `--tick SECONDS` adds a clock for that case:
+Rules normally react to incoming messages, so they cannot fire while every
+input is quiet. `--tick SECONDS` adds a clock for that case:
 
 ```shell
 ./awk-red --tick 300 -r ~/rules       # every five minutes
@@ -487,7 +576,7 @@ a summary - is a `reg()` and a function like any other, and
 
 The clock lives in the shell, not in AWK, so two things are worth knowing:
 
-* `--tick` is a complete run on its own: no broker, no `mosquitto_sub` and no
+* `--tick` is a complete run on its own: no subscription, no listener and no
   port are needed for the clock to run
 * never publish to `^awk-red/tick/` from a rule. With the default subscription
   the router receives its own messages back, so such a rule re-triggers itself
@@ -510,10 +599,10 @@ echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
 * keep `-v` out of it and use `-q`, so the journal holds errors instead of one
   line per message
 * `Type=simple`, since the script runs in the foreground
-* `--mqtt` (or `AWKRED_MQTT=1` in the unit's environment) when the rules
-  should react to broker traffic - without it there is no subscription at all
-* `--tick` only if the rules need it, so `AWKRED_TICK=0` stays the default and
-  an installation with no scheduled work behaves exactly like the examples
+* enable only the inputs the rules need, each asked for on its own: `--mqtt`
+  (or `AWKRED_MQTT=1`) to react to the broker, `--http-port` for webhooks,
+  `--tick` for scheduled work. A clock nobody asked for stays off, so an
+  installation with no scheduled work behaves exactly like the examples
 
 ```shell
 sudo install -m755 awk-red /usr/local/bin/awk-red
@@ -529,11 +618,11 @@ with `-e /etc/awk-red/.env`. Do not commit it.
 
 ## Troubleshooting
 
-**It exits immediately with `no input source`.** Nothing subscribes by
-default: add `--mqtt`, `--http-port`, `--tick` or `-i`. `-h`/`MQTT_HOST` only
-configure where a subscription would connect, they do not create one.
+**It exits immediately with `no input source`.** No input runs by default:
+add `--mqtt`, `--http-port`, `--tick` or `-i`. `-h`/`MQTT_HOST` only configure
+where a subscription would connect, they do not create one.
 
-**No output at all.** Check the subscription and the rules:
+**No output at all.** Check the input and the rules. For an MQTT input:
 
 ```shell
 ./awk-red -l                      # are any rules loaded?
@@ -581,6 +670,9 @@ does, the alternatives that were rejected, and what is worth building next.
   handler stalls every other rule. Scheduled work comes from `--tick` instead.
 * A tick is one message per interval, not a general timer wheel: there is one
   interval, and it is the same for every rule.
+* `chain()` is depth-limited (`AWKRED_CHAIN_MAX`, default 32) and cannot
+  branch-and-merge: a chained event runs through the normal pipeline once, like
+  any other message.
 * HTTP webhooks answer one connection at a time (see *HTTP webhooks*); a
   client that connects and never sends a request is dropped after 1.5 s.
 * This is not Node-RED. It is comfortable up to roughly a hundred

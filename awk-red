@@ -23,7 +23,7 @@
 set -euo pipefail
 
 readonly PROG=awk-red
-readonly VERSION=v0.4.0
+readonly VERSION=v0.5.0
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     printf '%s: bash 4.4 or newer is required (found %s)\n' "$PROG" "$BASH_VERSION" >&2
@@ -140,7 +140,8 @@ done
 # variables that were already exported win over whatever .env sets.
 CONFIG_VARS="MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASS MQTT_TLS MQTT_CAFILE \
 MQTT_CLIENT_ID MQTT_TOPIC DRYRUN AWKRED_RULES AWKRED_FIRST_MATCH \
-AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT AWKRED_TEST_STEP"
+AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT AWKRED_TEST_STEP \
+AWKRED_CHAIN_MAX"
 
 declare -A PRESET=()
 for name in $CONFIG_VARS; do
