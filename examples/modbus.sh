@@ -7,7 +7,7 @@
 # column decides the -t argument and rows of different types are simply separate
 # invocations - Modbus has no single request that spans them.
 #
-#   usage: modbus.sh HOST [MAP]
+#   usage: modbus.sh [-?|--help] HOST [MAP]
 #
 # mbpoll is not a dependency of awk-red, only of this recipe:
 #     sudo apt install mbpoll          # or build github.com/epsilonrt/mbpoll
@@ -29,9 +29,43 @@
 # stand-in.
 set -uo pipefail
 
-host=${1:-${MODBUS_HOST:-}}
 here=$(dirname -- "${BASH_SOURCE[0]}")
-map=${2:-${MODBUS_MAP:-$here/modbus.map}}
+
+usage() {
+    cat <<EOF
+modbus.sh - Modbus/TCP -> awk-red recipe
+
+usage: modbus.sh [-?|--help] HOST [MAP]
+
+Runs one mbpoll read per map row and prints the values as awk-red
+"topic payload" lines, ready for a poll:
+
+    awk-red --pipe './examples/modbus.sh HOST' --every 5 --changed
+
+HOST   Modbus/TCP device (or MODBUS_HOST)
+MAP    register map (or MODBUS_MAP), default $here/modbus.map
+       columns: slave type addr count fmt topic
+       type: coil (0x) | discrete (1x) | input (3x) | holding (4x)
+       fmt:  - | int16 | hex | string | int | float
+
+MODBUS_PORT  TCP port (default 502)
+MBPOLL       mbpoll binary to run, not an awk-red dependency
+
+  -?, --help   show this help and exit
+EOF
+}
+
+posargs=()
+while (( $# )); do
+    case $1 in
+        -\?|--help) usage; exit 0 ;;
+        -*) printf 'modbus.sh: unknown option: %s\n' "$1" >&2; exit 2 ;;
+        *) posargs+=("$1"); shift ;;
+    esac
+done
+
+host=${posargs[0]:-${MODBUS_HOST:-}}
+map=${posargs[1]:-${MODBUS_MAP:-$here/modbus.map}}
 port=${MODBUS_PORT:-502}
 mbpoll=${MBPOLL:-mbpoll}
 

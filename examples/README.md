@@ -19,6 +19,8 @@ rules work out of the box and double as a starting point for your own.
 | `json.awk` | a JSON topic extracted by `json()`, so the handler sees plain text |
 | `chain.awk` | one reading split into internal events with `chain()`, handled by other rules |
 | `heartbeat.awk` | scheduled work from the built-in clock, publishing a heartbeat topic |
+| `modbus.sh` | a `--pipe` poll: one register read per row of `modbus.map`, printed as topics |
+| `modbus.map` | the register map (`slave type addr count fmt topic`) the recipe reads |
 | `messages.log` | a recorded `mosquitto_sub -v` stream used by `--input` |
 
 Point a real broker at them and publish:
@@ -42,6 +44,21 @@ just a line in a recording:
 ```shell
 echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
 ```
+
+## `modbus.sh`
+
+A `--pipe` recipe that turns a Modbus/TCP device into topics: for each row of
+`modbus.map` it runs one `mbpoll` read and prints the value as `topic payload`.
+Different register types need different reads, so the map's `type` column picks
+the Modbus function code.
+
+```shell
+awk-red --pipe './examples/modbus.sh 10.0.0.5' --every 5 --changed
+```
+
+It needs `mbpoll` (not an awk-red dependency): `sudo apt install mbpoll`.
+`MODBUS_HOST`, `MODBUS_PORT` (default 502) and `MODBUS_MAP` set the defaults.
+`./examples/modbus.sh --help` (or `-?`) explains the map columns and options.
 
 ## `messages.log`
 
