@@ -360,7 +360,7 @@ process:
 write_loop (background subshell, owns the fifo)
   |- mosquitto_sub     the subscription, only with --mqtt
   |- tick_loop         the clock, when --tick is on
-  |- http_loop         the HTTP listener, when --http-port is on
+  |- http_loop         the HTTP listener, when --webhook is on
 
 gawk -f lib/router.awk ... < "$fifo"          the engine
 ```
@@ -415,10 +415,10 @@ the run in roughly 30 ms.
 
 ## HTTP on the same fifo
 
-`--http-port` puts another writer in `write_loop`. It had to live there: with
+`--webhook` puts another writer in `write_loop`. It had to live there: with
 `--mqtt`, the run ends with the subscription, and if the listener kept the fifo
 open after that, the engine would never see end of input and awk-red would hang
-on its final `wait`. So `http_loop` is started only when the port is on and is
+on its final `wait`. So `http_loop` is started only when webhooks are on and is
 added to the `TERM`/`INT` trap alongside the other children.
 
 `http_loop` also propagates what it waits on: the listener's exit status
@@ -426,7 +426,7 @@ becomes the subshell's status, which `write_loop` reports under its own name
 (`http listener exited with status N`). Without that, a listener that crashed
 on start-up or was killed mid-run would leave a run that looks healthy while
 answering nothing - the exact failure the preflight only covers for the
-"port taken" case. With `--http-port` as the *only* input, that status is the
+"port taken" case. With `--webhook` as the *only* input, that status is the
 whole story of the run, which is what makes an http-only mode viable.
 
 Everything else about it is gawk's `/inet/tcp`, which is not a web server:

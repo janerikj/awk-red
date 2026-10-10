@@ -10,14 +10,14 @@
 #   * line-buffers the pipeline (see "Buffering" in README.md)
 #   * starts the enabled input sources and supervises child processes cleanly
 #
-# Inputs are opt-in: --mqtt subscribes to the broker, --http-port listens for
+# Inputs are opt-in: --mqtt subscribes to the broker, --webhook listens for
 # webhooks, --tick runs the clock, --pipe runs a command, -i replays a
 # recording. At least one is required. MQTT_HOST/MQTT_PORT configure the broker
 # for pub() either way.
 #
 # gawk does what awk is good at: matching, transforming and dispatching.
 #
-#   usage: awk-red [--mqtt [-h host] [-p port]] [--http-port [port]]
+#   usage: awk-red [--mqtt [-h host] [-p port]] [--webhook] [-P port]
 #                 [--tick seconds] [-i file] [-t topic] [-r rules] [-e env]
 #                 [-n] [-l] [-v] [-q] [-?] [--version]
 #
@@ -50,13 +50,14 @@ $PROG $VERSION - event router: inputs -> gawk -> rules
 
 inputs (at least one is required):
       --mqtt          subscribe to the broker        (AWKRED_MQTT, default off)
+      --webhook       listen for HTTP webhooks       (AWKRED_WEBHOOK, default off)
       --pipe CMD      run CMD and treat its stdout as a subscription
                       (AWKRED_PIPE; --every SECONDS to poll)
   -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
       --tick SECONDS  a clock message on awk-red/tick/<timestamp> every SECONDS
                       (AWKRED_TICK, default 0 = off)
-  -P, --http-port [PORT]  listen for HTTP requests on all interfaces
-                      (AWKRED_HTTP_PORT, default 0 = off; -P alone uses 8080)
+  -P, --http-port PORT  HTTP listen port when --webhook is on
+                      (AWKRED_HTTP_PORT, default 8080)
 
 broker (for --mqtt and for pub() in every mode):
   -h, --host HOST     broker hostname                (MQTT_HOST,   default localhost)
@@ -84,6 +85,7 @@ precedence: command line > environment > .env > built-in default
 examples:
   $PROG -n -i examples/messages.log       dry run against a recording
   $PROG --mqtt -h mqtt.local -r ./rules   subscribe, with your own rules
+  $PROG --webhook -P 8080 -r ./rules       webhooks only, no broker needed
   $PROG --tick 300 -r ./rules             clock only, no broker needed
   $PROG -l -r ./rules                     show what would handle what
 EOF
@@ -94,7 +96,7 @@ EOF
 OPT_HOST="" OPT_PORT="" OPT_TOPIC="" OPT_RULES="" OPT_ENV=""
 OPT_INPUT="" OPT_DRYRUN="" OPT_LIST="" OPT_VERBOSE="" OPT_QUIET=""
 OPT_FIRST_MATCH="" OPT_HELP="" OPT_VERSION="" OPT_TICK="" OPT_HTTP_PORT=""
-OPT_MQTT="" OPT_PIPE="" OPT_EVERY="" OPT_CHANGED=""
+OPT_MQTT="" OPT_PIPE="" OPT_EVERY="" OPT_CHANGED="" OPT_WEBHOOK=""
 
 need_value() { (( $2 >= 2 )) || usage_error "option $1 requires a value"; }
 
@@ -105,13 +107,10 @@ while (( $# )); do
         -p|--port)          need_value "$1" $#; OPT_PORT=$2; shift 2 ;;
         --port=*)           OPT_PORT=${1#*=}; shift ;;
         -P|--http-port)
-            if [[ $# -ge 2 && $2 != -* && $2 =~ ^[0-9]+$ ]]; then
-                OPT_HTTP_PORT=$2; shift 2
-            else
-                OPT_HTTP_PORT=8080; shift
-            fi
+            need_value "$1" $#; OPT_HTTP_PORT=$2; shift 2
             ;;
         --http-port=*)      OPT_HTTP_PORT=${1#*=}; shift ;;
+        --webhook)          OPT_WEBHOOK=1; shift ;;
         -t|--topic)         need_value "$1" $#; OPT_TOPIC=$2; shift 2 ;;
         --topic=*)          OPT_TOPIC=${1#*=}; shift ;;
         -r|--rules)         need_value "$1" $#; OPT_RULES=$2; shift 2 ;;
@@ -151,7 +150,7 @@ done
 # variables that were already exported win over whatever .env sets.
 CONFIG_VARS="MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASS MQTT_TLS MQTT_CAFILE \
 MQTT_CLIENT_ID MQTT_TOPIC DRYRUN AWKRED_RULES AWKRED_FIRST_MATCH \
-AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT AWKRED_TEST_STEP \
+AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT AWKRED_WEBHOOK AWKRED_TEST_STEP \
 AWKRED_CHAIN_MAX AWKRED_PIPE AWKRED_PIPE_EVERY AWKRED_PIPE_CHANGED"
 
 declare -A PRESET=()
@@ -192,7 +191,7 @@ MQTT_TOPIC=${OPT_TOPIC:-${MQTT_TOPIC:-#}}
 RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-examples}}
 DRYRUN=${OPT_DRYRUN:-${DRYRUN:-0}}
 TICK=${OPT_TICK:-${AWKRED_TICK:-0}}
-HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-0}}
+HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-8080}}
 PIPE_CMD=${OPT_PIPE:-${AWKRED_PIPE:-}}
 PIPE_EVERY=${OPT_EVERY:-${AWKRED_PIPE_EVERY:-0}}
 PIPE_CHANGED=${OPT_CHANGED:-${AWKRED_PIPE_CHANGED:-0}}
@@ -200,12 +199,16 @@ case ${PIPE_CHANGED:-0} in
     1|true|yes|on) PIPE_CHANGED=1 ;;
     *)             PIPE_CHANGED=0 ;;
 esac
-# The subscription is opt-in: --mqtt or AWKRED_MQTT=1. MQTT_HOST/MQTT_PORT are
-# broker configuration for pub() as well, so setting them never switches the
-# input on by itself.
+# The subscription is opt-in: --mqtt or AWKRED_MQTT=1. HTTP webhooks: --webhook
+# or AWKRED_WEBHOOK=1. MQTT_HOST/MQTT_PORT are broker configuration for pub() as
+# well, so setting them never switches the input on by itself.
 MQTT_ON=0
+WEBHOOK_ON=0
 if [[ -n $OPT_MQTT || ${AWKRED_MQTT:-0} =~ ^(1|true|yes|on)$ ]]; then
     MQTT_ON=1
+fi
+if [[ -n $OPT_WEBHOOK || ${AWKRED_WEBHOOK:-0} =~ ^(1|true|yes|on)$ ]]; then
+    WEBHOOK_ON=1
 fi
 export MQTT_HOST MQTT_PORT MQTT_TOPIC DRYRUN
 export AWKRED_RULES="$RULES_DIR"
@@ -226,8 +229,8 @@ if (( TICK > 0 )) && [[ -n $OPT_INPUT ]]; then
     usage_error "--tick cannot be combined with --input; put an awk-red/tick line in the recording"
 fi
 
-if [[ ! $HTTP_PORT =~ ^[0-9]+$ ]] || (( HTTP_PORT < 0 || HTTP_PORT > 65535 )); then
-    usage_error "--http-port takes a port number 1-65535, 0 to disable (got: $HTTP_PORT)"
+if [[ ! $HTTP_PORT =~ ^[0-9]+$ ]] || (( HTTP_PORT < 1 || HTTP_PORT > 65535 )); then
+    usage_error "--http-port takes a port number 1-65535 (got: $HTTP_PORT)"
 fi
 
 if [[ ! $PIPE_EVERY =~ ^[0-9]+$ ]]; then
@@ -244,21 +247,21 @@ if [[ -n $OPT_INPUT ]]; then
     if [[ -n $OPT_MQTT ]]; then
         usage_error "--mqtt cannot be combined with --input"
     fi
-    if [[ -n $OPT_HTTP_PORT && $OPT_HTTP_PORT -gt 0 ]]; then
-        usage_error "--http-port cannot be combined with --input"
+    if (( WEBHOOK_ON )); then
+        usage_error "--webhook cannot be combined with --input"
     fi
     if [[ -n $PIPE_CMD ]]; then
         usage_error "--pipe cannot be combined with --input"
     fi
-    HTTP_PORT=0
+    WEBHOOK_ON=0
     MQTT_ON=0
 fi
 
 # A run with no input at all would sit on a fifo nobody writes to, so name the
 # ways in instead. --list-rules exits before any of this matters.
 if [[ -z $OPT_INPUT && -z $PIPE_CMD ]] && (( OPT_LIST == 0 )) &&
-   (( MQTT_ON == 0 && HTTP_PORT == 0 && TICK == 0 )); then
-    usage_error "no input source: enable one with --mqtt, --http-port, --tick, --pipe or --input"
+   (( MQTT_ON == 0 && WEBHOOK_ON == 0 && TICK == 0 )); then
+    usage_error "no input source: enable one with --mqtt, --webhook, --tick, --pipe or --input"
 fi
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 not found${2:+ ($2)}"; }
@@ -286,7 +289,7 @@ if (( gawk_major < 4 )); then
 fi
 
 [[ -r $ENGINE ]] || die "engine not readable: $ENGINE"
-if (( HTTP_PORT > 0 )); then
+if (( WEBHOOK_ON )); then
     [[ -r $HTTP_ENGINE ]] || die "HTTP engine not readable: $HTTP_ENGINE"
 fi
 if (( ! DRYRUN )) && ! command -v mosquitto_pub >/dev/null 2>&1; then
@@ -330,7 +333,7 @@ fi
 # gawk binds lazily on the first getline: a taken port returns immediately with
 # EADDRINUSE, a free one blocks in accept(). timeout tells the two apart, so no
 # dependency beyond coreutils (already required for stdbuf).
-if (( HTTP_PORT > 0 )); then
+if (( WEBHOOK_ON )); then
     HTTP_PREFLIGHT_RC=0
     timeout 0.3 "$GAWK" -v PORT="$HTTP_PORT" '
         BEGIN {
@@ -359,7 +362,7 @@ if [[ -z $OPT_QUIET ]]; then
     if (( TICK > 0 )); then
         printf '  clock    every %d s, on topic awk-red/tick/<timestamp>\n' "$TICK" >&2
     fi
-    if (( HTTP_PORT > 0 )); then
+    if (( WEBHOOK_ON )); then
         printf '  http     port %d, on topic <method>/<path>\n' "$HTTP_PORT" >&2
     fi
     if [[ -n $PIPE_CMD ]]; then
@@ -545,7 +548,7 @@ fi
 #   write_loop (subshell, owns the fifo)
 #     |- mosquitto_sub   the subscription, when --mqtt is on
 #     |- tick_loop       the clock, when --tick is on
-#     |- http_loop       HTTP listener, when --http-port is on
+#     |- http_loop       HTTP listener, when --webhook is on
 #     |- pipe_loop       the --pipe command, when --pipe is on
 #
 # What the run waits for follows from which inputs are on:
@@ -576,7 +579,7 @@ write_loop() {
 
     # A second writer on the same fifo. Writes below PIPE_BUF are atomic, so a
     # tick line can never be spliced into a real message.
-    if (( HTTP_PORT > 0 )); then
+    if (( WEBHOOK_ON )); then
         http_loop &
         http_pid=$!
         src_names+=("http listener")

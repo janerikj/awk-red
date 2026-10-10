@@ -30,10 +30,10 @@ Nothing else
 about the run is faked: the real `awk-red` binary, the real engine, the real
 example rules and a real fifo are all used.
 
-Inputs are opt-in (`--mqtt`, `--http-port`, `--tick`, `-i`), so every case
+Inputs are opt-in (`--mqtt`, `--webhook`, `--tick`, `-i`), so every case
 names the ones it wants and only those. To keep a developer's `.env` out of
 that decision the suite pins `AWKRED_MQTT=0`, `AWKRED_TICK=0`,
-`AWKRED_HTTP_PORT=0` and `AWKRED_TEST_STEP=0` before running anything.
+`AWKRED_HTTP_PORT=8080`, `AWKRED_WEBHOOK=0` and `AWKRED_TEST_STEP=0` before running anything.
 
 ## The fake subscriber
 

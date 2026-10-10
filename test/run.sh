@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.." || exit 1
 export MOSQ_SUB="$PWD/test/fake-mosquitto-sub"
 # Inputs are opt-in and each case names the ones it wants: a developer's .env
 # must not switch one on (or off) behind the suite's back.
-export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=0
+export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=8080 AWKRED_WEBHOOK=0
 # The rate-limit test seam, pinned like the inputs: a value in a developer's
 # .env must not move a window behind the suite's back.
 export AWKRED_TEST_STEP=0
@@ -335,12 +335,12 @@ case_validation() {
     "$AWKRED" --http-port 99999 >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 2 )) || bad "--http-port 99999 gave exit $rc"
-    "$AWKRED" -P 0 -l >/dev/null 2>"$ERR"
+    "$AWKRED" -P 0 >/dev/null 2>"$ERR"
     rc=$?
-    (( rc == 0 )) || bad "-P 0 gave exit $rc"
-    "$AWKRED" -P 9 -i examples/messages.log >/dev/null 2>"$ERR"
+    (( rc == 2 )) || bad "-P 0 gave exit $rc"
+    "$AWKRED" --webhook -i examples/messages.log >/dev/null 2>"$ERR"
     rc=$?
-    (( rc == 2 )) || bad "-P with -i gave exit $rc"
+    (( rc == 2 )) || bad "--webhook with -i gave exit $rc"
     "$AWKRED" --mqtt -i examples/messages.log >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 2 )) || bad "--mqtt with -i gave exit $rc"
@@ -362,7 +362,7 @@ case_help_and_version() {
     CASE="help lists both forms of every paired flag"
     "$AWKRED" --help >"$OUT" 2>&1 || bad "help exited $?"
     local flag
-    for flag in -n --dry-run -h --host -i --input -r --rules --tick --mqtt; do
+    for flag in -n --dry-run -h --host -i --input -r --rules --tick --mqtt --webhook; do
         grep -qF -- "$flag" "$OUT" || bad "help does not mention $flag"
     done
     "$AWKRED" --version >/dev/null 2>&1 || bad "--version exited $?"
@@ -374,7 +374,7 @@ case_http_off_by_default() {
     CASE="http is off by default"
     local banner
     banner=$("$AWKRED" -n -q -i examples/messages.log 2>&1 >/dev/null)
-    [[ $banner != *"http"* ]] || bad "the banner mentions http without --http-port"
+    [[ $banner != *"http"* ]] || bad "the banner mentions http without --webhook"
     pass "$CASE"
 }
 
@@ -383,7 +383,7 @@ case_http_routes() {
     local rc rc_msg rc_prec port
     port=$((20000 + RANDOM % 10000))
     # An http-only run: -h is a broker setting, never an input of its own.
-    start_awkred -n -v --http-port "$port" -r test/rules
+    start_awkred -n -v --webhook -P "$port" -r test/rules
     sleep 1.2
     http_get "$port" "/hook/x?p=HOOKPAYLOAD"
     rc=$?
@@ -429,7 +429,7 @@ case_http_port_taken() {
     fi
     # The preflight must fail fast and exit 1. If anything makes awk-red go
     # live instead, timeout keeps the suite from hanging forever on it.
-    timeout 15 "$AWKRED" -n -q --http-port "$port" >/dev/null 2>"$ERR"
+    timeout 15 "$AWKRED" -n -q --webhook -P "$port" >/dev/null 2>"$ERR"
     rc=$?
     kill $occup 2>/dev/null; wait $occup 2>/dev/null
     (( rc == 1 )) || bad "exit $rc (expected 1), stderr: $(cat "$ERR")"
@@ -442,7 +442,7 @@ case_http_deny() {
     CASE="http with refused subscription exits 5 without hang"
     local rc port
     port=$((22000 + RANDOM % 10000))
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt --http-port "$port" -h test.invalid >/dev/null 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt --webhook -P "$port" -h test.invalid >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means hung), stderr: $(cat "$ERR")"
     assert_no_strays
@@ -453,7 +453,7 @@ case_http_sigterm() {
     CASE="http listener stops cleanly on SIGTERM"
     local rc port
     port=$((23000 + RANDOM % 10000))
-    start_awkred -n --http-port "$port"
+    start_awkred -n --webhook -P "$port"
     sleep 1.0
     finish_awkred TERM
     rc=$?
@@ -714,7 +714,7 @@ case_http_death() {
     CASE="a killed http listener ends the run with its status"
     local rc port listener
     port=$((24000 + RANDOM % 10000))
-    start_awkred -n --http-port "$port"
+    start_awkred -n --webhook -P "$port"
     sleep 1.0
     listener=$(pgrep -g "$RUN_PID" -f 'lib/http\.awk' | head -n 1)
     if [[ -z $listener ]]; then

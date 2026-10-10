@@ -20,14 +20,14 @@ other programs. awk-red is that idea implemented as two files - a shell script
 that handles what AWK is bad at, and a small AWK engine that routes.
 
 Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
-a broker, `--http-port` serves HTTP webhooks, `--tick` adds a clock, `--pipe`
+a broker, `--webhook` serves HTTP webhooks, `--tick` adds a clock, `--pipe`
 runs a command, `-i` replays a recording. A run needs at least one of them;
 broker settings (`-h`, `MQTT_HOST`, ...) only configure connections and never
 switch an input on by themselves.
 
 ```
 --mqtt       mosquitto_sub -v -t '#'   the MQTT subscription
---http-port  HTTP clients              webhooks
+--webhook    HTTP clients              webhooks
 --tick       the clock                 a message every interval
 --pipe CMD   any command's stdout      a poller or a feed
 -i FILE      a recording               a fixed stream
@@ -126,7 +126,8 @@ never committed.
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
 | `AWKRED_CHAIN_MAX` | `32` | maximum `chain()` hops before an event is dropped |
 | `AWKRED_TICK` | `0` | clock interval in seconds, `0` is off (`--tick`) |
-| `AWKRED_HTTP_PORT` | `0` | listen for HTTP webhooks on this port, `0` is off (`--http-port`) |
+| `AWKRED_WEBHOOK` | `0` | `1` listens for HTTP webhooks (`--webhook`) |
+| `AWKRED_HTTP_PORT` | `8080` | HTTP listen port when webhooks are on (`-P`) |
 | `AWKRED_ENV` | `./.env` if present | env file to load (`-e`) |
 
 > [!NOTE]
@@ -153,14 +154,14 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
+    --webhook       serve HTTP webhooks (port set by -P or AWKRED_HTTP_PORT)
     --pipe CMD      run CMD and treat its stdout as a subscription, one
-                    "topic payload" line per message (AWKRED_PIPE)
+                     "topic payload" line per message (AWKRED_PIPE)
     --every SECONDS with --pipe, rerun CMD every SECONDS (a poll; a failed
-                    run is retried)
+                     run is retried)
     --changed       with --pipe, drop a topic's repeated payloads
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
--P, --http-port [PORT]  serve HTTP webhooks on PORT (default 8080 if given
-                    without a value; off unless set)
+-P, --http-port PORT   HTTP listen port when --webhook is on (default 8080)
 -n, --dry-run       print commands instead of running them
 -l, --list-rules    list the loaded rules and exit
 -v, --verbose       log routing decisions to stderr
@@ -170,9 +171,9 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
     --version       show version
 ```
 
-At least one input is required: `--mqtt`, `--http-port`, `--tick`, `--pipe` or
+At least one input is required: `--mqtt`, `--webhook`, `--tick`, `--pipe` or
 `-i`. `-i` is exclusive with every live input - a recording is already a
-complete stream, so `--mqtt`, `--http-port`, `--pipe` and `--tick` are rejected
+complete stream, so `--mqtt`, `--webhook`, `--pipe` and `--tick` are rejected
 when it is given.
 
 Exit codes: `0` success, `1` dependency or runtime error, `2` usage error. A
@@ -485,9 +486,9 @@ command and should never reach the engine at all.
 ## HTTP webhooks
 
 HTTP is another input a rule can react to, off unless asked for:
-`--http-port PORT` or `AWKRED_HTTP_PORT`, where `-P` on its own means
-8080. It can be the whole input: `./awk-red -n --http-port 8080` needs no
-subscription at all (`pub()` in a rule still sends to the configured broker).
+`--webhook` (optionally with `-P PORT` or `AWKRED_HTTP_PORT`). It can be the
+whole input: `./awk-red -n --webhook` needs no subscription at all (`pub()` in a
+rule still sends to the configured broker).
 The listener binds all interfaces (there is no host option), so treat it like
 any other port you expose and firewall it accordingly.
 
@@ -638,7 +639,7 @@ echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
   line per message
 * `Type=simple`, since the script runs in the foreground
 * enable only the inputs the rules need, each asked for on its own: `--mqtt`
-  (or `AWKRED_MQTT=1`) to react to the broker, `--http-port` for webhooks,
+  (or `AWKRED_MQTT=1`) to react to the broker, `--webhook` for webhooks,
   `--tick` for scheduled work. A clock nobody asked for stays off, so an
   installation with no scheduled work behaves exactly like the examples
 
@@ -657,7 +658,7 @@ with `-e /etc/awk-red/.env`. Do not commit it.
 ## Troubleshooting
 
 **It exits immediately with `no input source`.** No input runs by default:
-add `--mqtt`, `--http-port`, `--tick` or `-i`. `-h`/`MQTT_HOST` only configure
+add `--mqtt`, `--webhook`, `--tick` or `-i`. `-h`/`MQTT_HOST` only configure
 where a subscription would connect, they do not create one.
 
 **No output at all.** Check the input and the rules. For an MQTT input:
