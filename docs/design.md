@@ -252,12 +252,32 @@ yields exactly one survivor, step equal to the window means every message
 crosses it, and neither can flake. Like `MOSQ_SUB` it is a tool path rather
 than configuration, so it stays out of `.env.example`.
 
+## Change detection (built in v0.6.0)
+
+`changed(pattern)` drops a matching topic's repeated payloads: a message is
+routed only when its payload differs from the last one that was. It is the
+level-to-edge conversion a republished sensor reading, or a re-read register,
+needs, and it is deliberately the same shape as `limit()`: first match wins,
+state per exact topic, engine-wide, listed by `--list-rules`.
+
+One choice worth recording: **it runs after the limiter.** A value the limiter
+throws away must not consume the edge - otherwise a changed reading dropped
+inside a window would make the next identical reading look unchanged, and the
+rule would never see the transition at all. Running dedup last means only a
+message that would have reached a rule updates the last-seen payload.
+
+The stage is separate from `--pipe --changed`. The flag de-dups one command's
+output at the source, before the engine, so a duplicate never crosses the fifo
+at all; the stage de-dups a topic regardless of which input produced it. A
+polled command uses the flag; a topic that several inputs can write uses the
+stage.
+
 ## Chaining rules (built in v0.5.0)
 
 `chain(topic, payload)` links rules in-process. A handler queues an event and
 the engine routes it after the current message, through the same
-`json()`/`smooth()`/`limit()` pipeline. The alternative is what rules did
-before: `pub()` to a new topic and let the subscription echo it back.
+`json()`/`smooth()`/`limit()`/`changed()` pipeline. The alternative is what
+rules did before: `pub()` to a new topic and let the subscription echo it back.
 
 The first design was to have the engine write the event into its own input fifo,
 which is literally "keep it in the application" and needs no new engine state.
@@ -279,9 +299,9 @@ recording:
 * **A queue, not a recursive `route()` call.** A handler can already call the
   engine's own `route()` (functions are global across `-f` files), and an early
   experiment did. It recurses, so a long chain grows the stack, and it skips
-  `json()`/`smooth()`/`limit()` entirely. The queue is iterative and feeds each
-  event back through the same stages as an external message, so "as if it
-  arrived" is the actual contract. `route()`, `feed()` and `drain()` are
+  `json()`/`smooth()`/`limit()`/`changed()` entirely. The queue is iterative and
+  feeds each event back through the same stages as an external message, so "as
+  if it arrived" is the actual contract. `route()`, `feed()` and `drain()` are
   therefore engine internals, not rule API: reachable because gawk has no
   visibility, but only `chain()` is meant to be called from a rule.
 * **Drained after the current message.** All matching handlers for a message
@@ -746,8 +766,9 @@ Deliberately not built into the core:
 
 ### Three questions that recur
 
-* **Dedup / last seen.** A poll has no idea what changed; `--changed` and a
-  persisted state file (Roadmap) are the same answer.
+* **Dedup / last seen.** A poll has no idea what changed; `--pipe --changed`
+  and the engine-level `changed()` stage (both v0.6.0) are that edge, and a
+  persisted state file (Roadmap) is the same answer across restarts.
 * **Lifetime.** A source that goes quiet is not a source that died - which is
   exactly the "a dead input is fatal and named" rule that *Inputs are opt-in*
   put in `write_loop`.
@@ -761,10 +782,6 @@ Roughly in order of value per effort:
 
 * **A `topic=` override for webhooks.** Let a request name the engine topic
   instead of deriving it from the method and path; see *HTTP on the same fifo*.
-* **A generic `--pipe` / `--exec` input.** The live counterpart of `--input`:
-  run a command and treat its lines as a subscription, optionally `--every` and
-  `--changed`. Unlocks serial, journald and RSS as recipes rather than code; see
-  *Other input sources*.
 * **A `--watch` / `--follow` input.** File and directory changes, and `tail -F`
   of a log, as topics; `inotifywait` when present, polling otherwise.
 * **A UDP listener** (`--udp-port`) beside the HTTP one, for syslog, StatsD and

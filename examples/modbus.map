@@ -1,0 +1,12 @@
+# examples/modbus.map - register map for examples/modbus.sh.
+#
+# One row per value (or per run of values) to read. See the header of
+# examples/modbus.sh for the columns; switch the topics to whatever your rules
+# expect.
+#
+#   slave  type      addr  count  fmt     topic
+#
+1        holding   100   1      int16   modbus/site1/temp
+1        input     1     1      int16   modbus/site1/status
+1        discrete  1     2      -       modbus/site1/alarm
+1        coil      1     1      -       modbus/site1/pump

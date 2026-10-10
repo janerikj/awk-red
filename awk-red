@@ -11,8 +11,9 @@
 #   * starts the enabled input sources and supervises child processes cleanly
 #
 # Inputs are opt-in: --mqtt subscribes to the broker, --http-port listens for
-# webhooks, --tick runs the clock, -i replays a recording. At least one is
-# required. MQTT_HOST/MQTT_PORT configure the broker for pub() either way.
+# webhooks, --tick runs the clock, --pipe runs a command, -i replays a
+# recording. At least one is required. MQTT_HOST/MQTT_PORT configure the broker
+# for pub() either way.
 #
 # gawk does what awk is good at: matching, transforming and dispatching.
 #
@@ -23,7 +24,7 @@
 set -euo pipefail
 
 readonly PROG=awk-red
-readonly VERSION=v0.5.0
+readonly VERSION=v0.6.0
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     printf '%s: bash 4.4 or newer is required (found %s)\n' "$PROG" "$BASH_VERSION" >&2
@@ -49,6 +50,8 @@ $PROG $VERSION - event router: inputs -> gawk -> rules
 
 inputs (at least one is required):
       --mqtt          subscribe to the broker        (AWKRED_MQTT, default off)
+      --pipe CMD      run CMD and treat its stdout as a subscription
+                      (AWKRED_PIPE; --every SECONDS to poll)
   -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
       --tick SECONDS  a clock message on awk-red/tick/<timestamp> every SECONDS
                       (AWKRED_TICK, default 0 = off)
@@ -65,6 +68,9 @@ options:
   -r, --rules DIR     rule directory, *.awk loaded in sorted order
                                                  (AWKRED_RULES, default examples)
   -e, --env FILE      env file to load           (AWKRED_ENV,  default ./.env)
+      --every SECONDS  with --pipe, rerun CMD every SECONDS (a poll; the
+                      command's failures are retried)
+      --changed        with --pipe, drop a topic's repeated payloads
   -n, --dry-run       print commands instead of running them (DRYRUN=1)
   -l, --list-rules    list the loaded rules and exit
   -v, --verbose       log routing decisions to stderr (AWKRED_VERBOSE=1)
@@ -88,7 +94,7 @@ EOF
 OPT_HOST="" OPT_PORT="" OPT_TOPIC="" OPT_RULES="" OPT_ENV=""
 OPT_INPUT="" OPT_DRYRUN="" OPT_LIST="" OPT_VERBOSE="" OPT_QUIET=""
 OPT_FIRST_MATCH="" OPT_HELP="" OPT_VERSION="" OPT_TICK="" OPT_HTTP_PORT=""
-OPT_MQTT=""
+OPT_MQTT="" OPT_PIPE="" OPT_EVERY="" OPT_CHANGED=""
 
 need_value() { (( $2 >= 2 )) || usage_error "option $1 requires a value"; }
 
@@ -114,6 +120,11 @@ while (( $# )); do
         --env=*)            OPT_ENV=${1#*=}; shift ;;
         -i|--input)         need_value "$1" $#; OPT_INPUT=$2; shift 2 ;;
         --input=*)          OPT_INPUT=${1#*=}; shift ;;
+        --pipe)             need_value "$1" $#; OPT_PIPE=$2; shift 2 ;;
+        --pipe=*)           OPT_PIPE=${1#*=}; shift ;;
+        --every)            need_value "$1" $#; OPT_EVERY=$2; shift 2 ;;
+        --every=*)          OPT_EVERY=${1#*=}; shift ;;
+        --changed)          OPT_CHANGED=1; shift ;;
         --tick)             need_value "$1" $#; OPT_TICK=$2; shift 2 ;;
         --tick=*)           OPT_TICK=${1#*=}; shift ;;
         --mqtt)             OPT_MQTT=1; shift ;;
@@ -141,7 +152,7 @@ done
 CONFIG_VARS="MQTT_HOST MQTT_PORT MQTT_USER MQTT_PASS MQTT_TLS MQTT_CAFILE \
 MQTT_CLIENT_ID MQTT_TOPIC DRYRUN AWKRED_RULES AWKRED_FIRST_MATCH \
 AWKRED_VERBOSE AWKRED_TICK AWKRED_HTTP_PORT AWKRED_MQTT AWKRED_TEST_STEP \
-AWKRED_CHAIN_MAX"
+AWKRED_CHAIN_MAX AWKRED_PIPE AWKRED_PIPE_EVERY AWKRED_PIPE_CHANGED"
 
 declare -A PRESET=()
 for name in $CONFIG_VARS; do
@@ -182,6 +193,13 @@ RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-examples}}
 DRYRUN=${OPT_DRYRUN:-${DRYRUN:-0}}
 TICK=${OPT_TICK:-${AWKRED_TICK:-0}}
 HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-0}}
+PIPE_CMD=${OPT_PIPE:-${AWKRED_PIPE:-}}
+PIPE_EVERY=${OPT_EVERY:-${AWKRED_PIPE_EVERY:-0}}
+PIPE_CHANGED=${OPT_CHANGED:-${AWKRED_PIPE_CHANGED:-0}}
+case ${PIPE_CHANGED:-0} in
+    1|true|yes|on) PIPE_CHANGED=1 ;;
+    *)             PIPE_CHANGED=0 ;;
+esac
 # The subscription is opt-in: --mqtt or AWKRED_MQTT=1. MQTT_HOST/MQTT_PORT are
 # broker configuration for pub() as well, so setting them never switches the
 # input on by itself.
@@ -211,6 +229,17 @@ fi
 if [[ ! $HTTP_PORT =~ ^[0-9]+$ ]] || (( HTTP_PORT < 0 || HTTP_PORT > 65535 )); then
     usage_error "--http-port takes a port number 1-65535, 0 to disable (got: $HTTP_PORT)"
 fi
+
+if [[ ! $PIPE_EVERY =~ ^[0-9]+$ ]]; then
+    usage_error "--every takes whole seconds (got: $PIPE_EVERY)"
+fi
+if [[ -n $OPT_EVERY && -z $PIPE_CMD ]]; then
+    usage_error "--every requires --pipe"
+fi
+if [[ -n $OPT_CHANGED && -z $PIPE_CMD ]]; then
+    usage_error "--changed requires --pipe"
+fi
+
 if [[ -n $OPT_INPUT ]]; then
     if [[ -n $OPT_MQTT ]]; then
         usage_error "--mqtt cannot be combined with --input"
@@ -218,15 +247,18 @@ if [[ -n $OPT_INPUT ]]; then
     if [[ -n $OPT_HTTP_PORT && $OPT_HTTP_PORT -gt 0 ]]; then
         usage_error "--http-port cannot be combined with --input"
     fi
+    if [[ -n $PIPE_CMD ]]; then
+        usage_error "--pipe cannot be combined with --input"
+    fi
     HTTP_PORT=0
     MQTT_ON=0
 fi
 
 # A run with no input at all would sit on a fifo nobody writes to, so name the
 # ways in instead. --list-rules exits before any of this matters.
-if [[ -z $OPT_INPUT ]] && (( OPT_LIST == 0 )) &&
+if [[ -z $OPT_INPUT && -z $PIPE_CMD ]] && (( OPT_LIST == 0 )) &&
    (( MQTT_ON == 0 && HTTP_PORT == 0 && TICK == 0 )); then
-    usage_error "no input source: enable one with --mqtt, --http-port, --tick or --input"
+    usage_error "no input source: enable one with --mqtt, --http-port, --tick, --pipe or --input"
 fi
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 not found${2:+ ($2)}"; }
@@ -330,6 +362,11 @@ if [[ -z $OPT_QUIET ]]; then
     if (( HTTP_PORT > 0 )); then
         printf '  http     port %d, on topic <method>/<path>\n' "$HTTP_PORT" >&2
     fi
+    if [[ -n $PIPE_CMD ]]; then
+        printf '  pipe     %s\n' "$PIPE_CMD" >&2
+        (( PIPE_EVERY > 0 )) && printf '  every    %d s\n' "$PIPE_EVERY" >&2
+        (( PIPE_CHANGED )) && printf '  changed  repeated payloads are dropped\n' >&2
+    fi
     if (( DRYRUN )); then
         printf '  mode     dry-run, commands are printed and not executed\n' >&2
     else
@@ -429,6 +466,68 @@ tick_loop() {
     done
 }
 
+# The generic pipe input. The command's stdout is "topic payload" lines, the
+# same wire every other source writes, so it needs no engine support at all.
+#
+#   * without --every the command is long-lived and its exit is a dead source:
+#     the process is handed over with exec, so its status is this source's and
+#     write_loop's own trap owns it - the same shape as mosquitto_sub.
+#   * with --every it is a poll: the command is rerun on a schedule and a failed
+#     run is retried, not fatal, because a single Modbus timeout (or a curl that
+#     lost the network for a moment) must not take the router down.
+#   * --changed drops a topic's repeated payloads. The state has to outlive a
+#     poll cycle, so the filter lives here, in the loop, and not in a process
+#     per run. It is deliberately per-source: --pipe is the only poll-shaped
+#     input, and a duplicate from a push source (MQTT, HTTP) is a real event,
+#     not noise. A rule that wants the same edge on any topic registers the
+#     engine-level changed() stage instead; see lib/router.awk.
+#
+# A pipe command that prints and then blocks is why every branch line-buffers
+# with stdbuf -oL: without it a C poller's output sits in a 4-8 KB block buffer.
+pipe_loop() {
+    local sleeper="" cmd_pid="" rc=0 line topic payload
+    declare -A last=()
+    trap 'kill "${sleeper:-}" "${cmd_pid:-}" 2>/dev/null; [[ -n ${PIPE_FIFO:-} ]] && rm -f "$PIPE_FIFO"; exit 0' TERM INT
+
+    if (( PIPE_EVERY == 0 )) && (( ! PIPE_CHANGED )); then
+        exec stdbuf -oL bash -c "$PIPE_CMD"
+    fi
+
+    # A private fifo so the command's pid stays trackable while its output is
+    # read in this shell: a plain "cmd | filter" pipeline would leave the
+    # command behind on shutdown, because killing $! only reaches the filter.
+    PIPE_FIFO=$(mktemp -u "${TMPDIR:-/tmp}/awk-red.pipe.XXXXXX") || return 1
+    mkfifo "$PIPE_FIFO" || { rm -f "$PIPE_FIFO"; return 1; }
+
+    while :; do
+        stdbuf -oL bash -c "$PIPE_CMD" > "$PIPE_FIFO" &
+        cmd_pid=$!
+        while IFS= read -r line; do
+            if (( PIPE_CHANGED )); then
+                topic=${line%% *}
+                if [[ $line == *" "* ]]; then payload=${line#* }; else payload=""; fi
+                [[ ${last[$topic]+set} && ${last[$topic]} == "$payload" ]] && continue
+                last[$topic]=$payload
+            fi
+            printf '%s\n' "$line"
+        done < "$PIPE_FIFO"
+        wait "$cmd_pid" 2>/dev/null || rc=$?
+        cmd_pid=""
+
+        if (( PIPE_EVERY == 0 )); then
+            rm -f "$PIPE_FIFO"
+            return "$rc"
+        fi
+
+        # One-second slices, so a shutdown is acted on within a second.
+        for (( remaining = PIPE_EVERY; remaining > 0; remaining-- )); do
+            sleep 1 &
+            sleeper=$!
+            wait "$sleeper" 2>/dev/null || true
+        done
+    done
+}
+
 sub_opts=()
 if (( MQTT_ON )); then
     sub_opts=(-h "$MQTT_HOST" -p "$MQTT_PORT" -v -t "$MQTT_TOPIC")
@@ -447,6 +546,7 @@ fi
 #     |- mosquitto_sub   the subscription, when --mqtt is on
 #     |- tick_loop       the clock, when --tick is on
 #     |- http_loop       HTTP listener, when --http-port is on
+#     |- pipe_loop       the --pipe command, when --pipe is on
 #
 # What the run waits for follows from which inputs are on:
 #
@@ -468,11 +568,11 @@ fi
 # The trap exits with $rc, not 0: a failure that has already been reaped must
 # not be turned into a clean stop by a shutdown arriving a moment later.
 write_loop() {
-    local sub_pid="" tick_pid="" http_pid=""
+    local sub_pid="" tick_pid="" http_pid="" pipe_pid=""
     local rc=0 src="" idx
     local -a src_names=() src_pids=()
 
-    trap 'kill ${http_pid:+"$http_pid"} ${tick_pid:+"$tick_pid"} ${sub_pid:+"$sub_pid"} 2>/dev/null; exit "$rc"' TERM INT
+    trap 'kill ${pipe_pid:+"$pipe_pid"} ${http_pid:+"$http_pid"} ${tick_pid:+"$tick_pid"} ${sub_pid:+"$sub_pid"} 2>/dev/null; exit "$rc"' TERM INT
 
     # A second writer on the same fifo. Writes below PIPE_BUF are atomic, so a
     # tick line can never be spliced into a real message.
@@ -488,6 +588,12 @@ write_loop() {
         src_names+=("clock")
         src_pids+=("$tick_pid")
     fi
+    if [[ -n $PIPE_CMD ]]; then
+        pipe_loop &
+        pipe_pid=$!
+        src_names+=("pipe command")
+        src_pids+=("$pipe_pid")
+    fi
 
     if (( MQTT_ON )); then
         # Both stages are line-buffered: without this the pipe chain stalls
@@ -496,9 +602,10 @@ write_loop() {
         sub_pid=$!
         wait "$sub_pid" || rc=$?
         src="mosquitto_sub"
-        # The clock and HTTP listener have no reason to outlive the subscription.
+        # The auxiliaries have no reason to outlive the subscription.
         stop_child "$tick_pid"
         stop_child "$http_pid"
+        stop_child "$pipe_pid"
     else
         wait -n || rc=$?
         for idx in "${!src_pids[@]}"; do

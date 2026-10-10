@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# test/bin/mbpoll - a stand-in for mbpoll.
+#
+# Prints the "[ref]: value" lines a real mbpoll prints for a read, derived from
+# the -r/-c/-t arguments, so the Modbus recipe can be tested without a device or
+# the real tool. Values are deterministic: bit types give ref % 2, register
+# types give 1000 + ref.
+#
+#   FAKE_MBPOLL_FAIL=1 exits 1 with a timeout message, for the error path.
+
+set -u
+
+ref=1 count=1 type=4
+args=("$@")
+for (( i = 0; i < ${#args[@]}; i++ )); do
+    case ${args[i]} in
+        -r) ref=${args[i + 1]} ;;
+        -c) count=${args[i + 1]} ;;
+        -t) type=${args[i + 1]} ;;
+    esac
+done
+
+if [[ ${FAKE_MBPOLL_FAIL:-0} == 1 ]]; then
+    printf 'mbpoll: Connection timed out\n' >&2
+    exit 1
+fi
+
+base=${type%%:*}
+for (( i = 0; i < count; i++ )); do
+    r=$(( ref + i ))
+    case $base in
+        0 | 1) v=$(( r % 2 )) ;;
+        *)     v=$(( 1000 + r )) ;;
+    esac
+    printf '[%d]:\t%d\n' "$r" "$v"
+done

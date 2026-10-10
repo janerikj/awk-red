@@ -730,6 +730,117 @@ case_http_death() {
     pass "$CASE"
 }
 
+case_pipe_stream() {
+    CASE="a pipe input routes to rules and stays alive when streaming"
+    FAKE_PIPE_MODE=emit FAKE_PIPE_COUNT=2 \
+        timeout 8 "$AWKRED" -n -v -r test/rules --pipe "$PWD/test/fake-pipe" >"$OUT" 2>"$ERR"
+    local lines
+    lines=$(grep -c 'route pipe/x' "$ERR")
+    (( lines == 2 )) || bad "$lines of 2 messages routed, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo pipe 'pipe/x=hello'" "$OUT" || bad "echo not found: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_pipe_fail_stream() {
+    CASE="a streaming pipe that dies ends the run with its status"
+    local rc
+    FAKE_PIPE_MODE=die FAKE_PIPE_CODE=3 \
+        timeout 15 "$AWKRED" -n -r test/rules --pipe "$PWD/test/fake-pipe" >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 3 )) || bad "exit $rc (124 means hung), stderr: $(cat "$ERR")"
+    grep -qF 'pipe command exited with status 3' "$ERR" || bad "stderr: $(cat "$ERR")"
+    pass "$CASE"
+}
+
+case_pipe_every_flaky() {
+    CASE="a polled pipe retries on failure and delivers once it recovers"
+    local rc
+    local state=$WORK/pipe.state
+    rm -f "$state"
+    # --every polls for ever, so this is a live run: start it, give the failed
+    # first poll and the successful second one time to happen, and stop it.
+    export FAKE_PIPE_MODE=flaky FAKE_PIPE_FAIL=1 FAKE_PIPE_STATE="$state"
+    start_awkred -n -q -r test/rules --pipe "$PWD/test/fake-pipe" --every 1
+    unset FAKE_PIPE_MODE FAKE_PIPE_FAIL FAKE_PIPE_STATE
+    sleep 3
+    finish_awkred TERM
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo pipe 'pipe/x=hello'" "$OUT" || bad "did not recover: $(cat "$OUT")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+case_pipe_changed() {
+    CASE="--changed suppresses repeated payloads for a pipe"
+    # The fake emits the same line twice; without --changed both route.
+    FAKE_PIPE_MODE=emit FAKE_PIPE_COUNT=2 \
+        timeout 6 "$AWKRED" -n -q -r test/rules --pipe "$PWD/test/fake-pipe" --changed >"$OUT" 2>"$ERR"
+    local ecount
+    ecount=$(grep -c "DRYRUN> echo pipe" "$OUT")
+    (( ecount == 1 )) || bad "expected 1 echo for two repeated lines with --changed, got $ecount: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_pipe_input_conflict() {
+    CASE="--pipe conflicts with --input"
+    local rc
+    "$AWKRED" --pipe "$PWD/test/fake-pipe" -i examples/messages.log >/dev/null 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "--pipe with --input gave exit $rc"
+    pass "$CASE"
+}
+
+case_pipe_with_mqtt_coexist() {
+    CASE="--pipe coexists with --mqtt"
+    # The subscriber is the terminator here and stays connected, so the run is
+    # stopped by the timeout; only the pipe's own delivery is asserted.
+    FAKE_PIPE_MODE=once FAKE_PIPE_COUNT=1 FAKE_SUB_MODE=accept \
+        timeout 8 "$AWKRED" -n -q -r test/rules --pipe "$PWD/test/fake-pipe" --mqtt -h test.invalid >"$OUT" 2>"$ERR"
+    grep -qF "DRYRUN> echo pipe 'pipe/x=hello'" "$OUT" || bad "pipe echo missing: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_pipe_modbus_recipe() {
+    CASE="the Modbus recipe maps register lines to friendly topics"
+    local rc maprc=$WORK/modbus.map
+    cat > "$maprc" <<'MAP'
+1	holding	100	1	int16	modbus/test/t1
+1	discrete	1	1	-	modbus/test/bit
+MAP
+    MBPOLL="$PWD/test/bin/mbpoll" \
+    MODBUS_HOST=test.local MODBUS_PORT=502 MODBUS_MAP="$maprc" \
+    timeout 6 "$AWKRED" -n -q -r test/rules --pipe "$PWD/examples/modbus.sh test.local '$maprc'" >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo pipe 'modbus/test/t1=1100'" "$OUT" || bad "t1 missing: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo pipe 'modbus/test/bit=1'" "$OUT" || bad "bit missing: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_changed_drop() {
+    CASE="changed() drops a repeated payload before routing"
+    local rc
+    printf 'edge/x on\nedge/x on\nedge/y on\nedge/x off\nedge/x off\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    [[ $(grep -c '^DRYRUN> echo edge ' "$OUT") == 3 ]] \
+        || bad "expected 3 edges of 5 messages, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo edge 'edge/x=on'" "$OUT" || bad "the first edge was dropped: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo edge 'edge/y=on'" "$OUT" || bad "edge/y does not keep state of its own: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo edge 'edge/x=off'" "$OUT" || bad "the second edge was dropped: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+case_changed_lists() {
+    CASE="a registered change detector is listed by --list-rules"
+    "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF 'changed ^edge/' "$OUT" || bad "no changed row: $(cat "$OUT")"
+    grep -qF '1 changed(s)' "$OUT" || bad "summary has no changed count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
 # --------------------------------------------------------------------- main
 
 cases=(
@@ -769,6 +880,15 @@ cases=(
     case_http_port_taken
     case_http_deny
     case_http_sigterm
+    case_pipe_stream
+    case_pipe_fail_stream
+    case_pipe_every_flaky
+    case_pipe_changed
+    case_pipe_input_conflict
+    case_pipe_with_mqtt_coexist
+    case_pipe_modbus_recipe
+    case_changed_drop
+    case_changed_lists
 )
 
 printf 'awk-red test suite\n\n'

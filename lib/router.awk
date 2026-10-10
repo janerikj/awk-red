@@ -7,6 +7,7 @@
 #   * JSON extraction, so rules never care whether a topic is plain or JSON
 #   * payload smoothing, so a jittery numeric topic reaches rules as an EMA
 #   * rate limits, so a noisy topic is dropped before any rule runs
+#   * change detection, so a level that is republished is not an event
 #   * in-process chaining: chain() queues a message for another rule
 #   * diagnostics: log(), debug(), warn(), error()
 #
@@ -244,6 +245,38 @@ function limited(topic,    i, key, now) {
     return 0
 }
 
+# ------------------------------------------------------------- dedup
+
+# changed(pattern) drops a matching topic's repeated payloads: a message only
+# reaches the rules when its payload differs from the last one that did, so a
+# level that a sensor keeps republishing - or a poll that reads the same
+# register twice - is not an event. It is the level-to-edge conversion that
+# turns "same value again" into nothing, and it is per exact topic, just like
+# smooth() and limit(). Patterns follow the same rules as reg(): first match
+# wins.
+function changed(pattern) {
+    CN++
+    CHANGED_PATTERN[CN] = pattern
+    debug("changed " pattern " -> drop repeated payloads per topic")
+}
+
+# 1 when the payload repeats the last one seen on the topic, so the message is
+# dropped before routing. The state is the last payload that passed, and this
+# stage runs after the limiter, so a value the limiter dropped never consumes
+# the edge - only a message that would have reached a rule updates it.
+function unchanged(topic, payload,    i, key) {
+    for (i = 1; i <= CN; i++) {
+        if (topic ~ CHANGED_PATTERN[i]) {
+            key = i SUBSEP topic
+            if ((key in LAST_PAYLOAD) && LAST_PAYLOAD[key] == payload)
+                return 1
+            LAST_PAYLOAD[key] = payload
+            return 0
+        }
+    }
+    return 0
+}
+
 # Internal: dispatch one message to every matching handler. Not part of the
 # rule-facing API - a rule hands work to another rule with chain(), never by
 # calling route() itself.
@@ -269,16 +302,23 @@ function route(topic, payload,    i, hits, fn) {
 # Internal: one message through the whole pipeline, whether it came from an
 # input or from chain(). JSON first (a JSON topic must yield the number before
 # it can be smoothed), smoothing next (the average needs every sample, including
-# messages the limiter is about to drop), the limiter last (it gates the rules
-# without gatekeeping the state). hops is 0 for an external message and grows by
-# one per chain(). Rules must not call this - it bypasses the queue and the hop
-# guard; use chain() instead.
+# messages the limiter is about to drop), the limiter next (it gates the rules
+# without gatekeeping the state), and change detection last, on the messages
+# that survived the limit, so a value the limiter threw away never looks like
+# the edge it was. hops is 0 for an external message and grows by one per
+# chain(). Rules must not call this - it bypasses the queue and the hop guard;
+# use chain() instead.
 function feed(topic, payload, hops) {
     payload = adapt(topic, payload)
     payload = smoothed(topic, payload)
     if (limited(topic)) {
         DROPPED++
         debug("limited " topic " (" payload ")")
+        return
+    }
+    if (unchanged(topic, payload)) {
+        UNCHANGED++
+        debug("unchanged " topic " (" payload ")")
         return
     }
     MSGS++
@@ -337,7 +377,7 @@ function build_pub_cmd(    cmd) {
 
 function list_rules(    i) {
     printf "rules from %s\n\n", RULES_DIR
-    if (N == 0 && JN == 0 && SN == 0 && LN == 0)
+    if (N == 0 && JN == 0 && SN == 0 && LN == 0 && CN == 0)
         print "  (nothing registered)"
     for (i = 1; i <= N; i++)
         printf "  rule    %-22s %-18s %s\n", ROUTE[i], HANDLER[i], DESC[i]
@@ -347,7 +387,9 @@ function list_rules(    i) {
         printf "  smooth  %-22s %-18s ema %s\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i]
     for (i = 1; i <= LN; i++)
         printf "  limit   %-22s %-18s 1 per %ds\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i]
-    printf "\n%d rule(s), %d json(s), %d smooth(s), %d limit(s)\n", N, JN, SN, LN
+    for (i = 1; i <= CN; i++)
+        printf "  changed %-22s %-18s per topic\n", CHANGED_PATTERN[i], "(payload)"
+    printf "\n%d rule(s), %d json(s), %d smooth(s), %d limit(s), %d changed(s)\n", N, JN, SN, LN, CN
 }
 
 BEGIN {
@@ -379,6 +421,7 @@ BEGIN {
     CUR_HOPS = 0
     MSGS = 0
     DROPPED = 0
+    UNCHANGED = 0
 }
 
 # The one generic rule: parse the line and dispatch. This is the whole engine.
@@ -399,5 +442,6 @@ END {
         list_rules()
     else if (VERBOSE && !QUIET)
         debug(MSGS " message(s) processed" \
-              (DROPPED > 0 ? ", " DROPPED " dropped by a rate limit" : ""))
+              (DROPPED > 0 ? ", " DROPPED " dropped by a rate limit" : "") \
+              (UNCHANGED > 0 ? ", " UNCHANGED " dropped as unchanged" : ""))
 }

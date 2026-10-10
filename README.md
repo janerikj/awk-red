@@ -1,10 +1,10 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.5.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.6.0-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
 
 A Node-RED style event router built on a small AWK engine, with MQTT, HTTP, a
-clock and recordings as the inputs.
+clock, a command's stdout and recordings as the inputs.
 
 Node-RED is built on a handful of simple ideas:
 
@@ -20,15 +20,16 @@ other programs. awk-red is that idea implemented as two files - a shell script
 that handles what AWK is bad at, and a small AWK engine that routes.
 
 Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
-a broker, `--http-port` serves HTTP webhooks, `--tick` adds a clock, `-i`
-replays a recording. A run needs at least one of them; broker settings (`-h`,
-`MQTT_HOST`, ...) only configure connections and never switch an input on by
-themselves.
+a broker, `--http-port` serves HTTP webhooks, `--tick` adds a clock, `--pipe`
+runs a command, `-i` replays a recording. A run needs at least one of them;
+broker settings (`-h`, `MQTT_HOST`, ...) only configure connections and never
+switch an input on by themselves.
 
 ```
 --mqtt       mosquitto_sub -v -t '#'   the MQTT subscription
 --http-port  HTTP clients              webhooks
 --tick       the clock                 a message every interval
+--pipe CMD   any command's stdout      a poller or a feed
 -i FILE      a recording               a fixed stream
 
         every input writes one line per message:  "topic payload"
@@ -86,7 +87,7 @@ mosquitto_pub -t home/door -m open
 awk-red              the application: .env, flags, dependencies, rule discovery,
                      line buffering, process supervision
 lib/router.awk       the engine: dispatch table, side effects, JSON extraction,
-                     smoothing, rate limits, in-process chaining, logging
+                     smoothing, rate limits, change detection, chaining, logging
 examples/            default rule directory (--rules), plus a recorded stream
 docs/design.md       why it is built this way, and what was tried instead
 .env.example         every configuration variable with its default
@@ -152,6 +153,11 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
+    --pipe CMD      run CMD and treat its stdout as a subscription, one
+                    "topic payload" line per message (AWKRED_PIPE)
+    --every SECONDS with --pipe, rerun CMD every SECONDS (a poll; a failed
+                    run is retried)
+    --changed       with --pipe, drop a topic's repeated payloads
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
 -P, --http-port [PORT]  serve HTTP webhooks on PORT (default 8080 if given
                     without a value; off unless set)
@@ -164,9 +170,10 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
     --version       show version
 ```
 
-At least one input is required: `--mqtt`, `--http-port`, `--tick` or `-i`.
-`-i` is exclusive with every live input - a recording is already a complete
-stream, so `--mqtt`, `--http-port` and `--tick` are rejected when it is given.
+At least one input is required: `--mqtt`, `--http-port`, `--tick`, `--pipe` or
+`-i`. `-i` is exclusive with every live input - a recording is already a
+complete stream, so `--mqtt`, `--http-port`, `--pipe` and `--tick` are rejected
+when it is given.
 
 Exit codes: `0` success, `1` dependency or runtime error, `2` usage error. A
 live input that fails for real carries its own status - `5` on a refused login -
@@ -209,6 +216,7 @@ minute" or "only on a state change".
 | `json(pattern, jq_filter)` | normalise a JSON payload before rules see it |
 | `smooth(pattern, factor)` | replace a numeric payload with a moving average before limits and rules |
 | `limit(pattern, seconds)` | drop matching messages to at most one per topic per window |
+| `changed(pattern)` | drop a matching topic's repeated payloads, so only a change is an event |
 | `chain(topic, payload)` | queue an internal event for another rule, no broker involved |
 | `pub(topic, payload)` | publish an MQTT message, using the configured broker |
 | `pub_retained(topic, payload)` | the same, with the retained flag |
@@ -243,18 +251,19 @@ emit("curl -fsS " shquote("https://example.org/hook?msg=" url))
 
 ## Engine-wide stages
 
-`json()`, `smooth()` and `limit()` are not per-rule. Each registers a
-per-topic stage that the engine runs on every message **before** routing, in
-registration order, first match wins. Three consequences:
+`json()`, `smooth()`, `limit()` and `changed()` are not per-rule. Each
+registers a per-topic stage that the engine runs on every message **before**
+routing, in registration order, first match wins. Three consequences:
 
 * A stage registered in one rule file changes what **every** rule on that topic
   sees, or whether it sees the message at all - across all rule files, including
-  ones loaded later. `limit()` in particular drops the message before routing,
-  so no handler runs, not just the handler in the registering file.
+  ones loaded later. `limit()` and `changed()` in particular drop the message
+  before routing, so no handler runs, not just the handler in the registering
+  file.
 * They are set up once, at load time, not called per message. You cannot scope
   one to a single handler; to gate a single rule, keep the state in that rule.
-* Overlapping patterns do not stack. The first `json()`, `smooth()` or `limit()`
-  that matches wins, and any later one for the same topic is inert.
+* Overlapping patterns do not stack. The first `json()`, `smooth()`, `limit()` or
+  `changed()` that matches wins, and any later one for the same topic is inert.
 
 `--list-rules` shows every registration, which is the quickest way to see what
 is acting on a topic.
@@ -263,8 +272,8 @@ is acting on a topic.
 
 Two rules are linked when a handler queues a new internal event with
 `chain(topic, payload)`. The queued event is routed right after the current
-message finishes, through the same `json()`/`smooth()`/`limit()` pipeline - but
-it never reaches the broker:
+message finishes, through the same `json()`/`smooth()`/`limit()`/`changed()`
+pipeline - but it never reaches the broker:
 
 ```awk
 # rules/chain.awk
@@ -311,10 +320,10 @@ Three things to know:
   copy to fall back on: if no `reg()` matches the chained topic, the event is
   discarded (logged as `no rule matched` with `-v`). Chain when the next step is
   another rule; publish when it has to leave the process.
-* **Chained events re-enter the pipeline.** They are normalised, smoothed and
-  rate-limited exactly like an external message, so a `json()` filter on the
-  chained topic runs on the payload the rule queued. Send the format that topic
-  expects.
+* **Chained events re-enter the pipeline.** They are normalised, smoothed,
+  rate-limited and de-duplicated exactly like an external message, so a `json()`
+  filter on the chained topic runs on the payload the rule queued. Send the
+  format that topic expects.
 * **A chain that matches itself is cut off.** The guard is a hop count,
   `AWKRED_CHAIN_MAX` (default 32); an event past it is dropped with a warning.
   Without it a self-matching chain would spin forever - the same feedback loop
@@ -410,11 +419,12 @@ Anchor the pattern with `$`: otherwise the rule also matches the
 `home/temp/filtered` topic it just published, and loops.
 
 The pipeline runs `json()` first (a JSON topic must yield the number before it
-can be averaged), smoothing next, the rate limiter last. So the average sees
-every sample - including messages the limiter drops, keeping the state
-current - while a rule still only runs for messages that pass the limit. A
-payload that is not a number passes through untouched and never touches the
-state, so a broad pattern cannot drag the average toward zero.
+can be averaged), smoothing next, the rate limiter next, and change detection
+last. So the average sees every sample - including messages the limiter drops,
+keeping the state current - while a rule still only runs for messages that pass
+the limit and differ from the last one that did. A payload that is not a number
+passes through untouched and never touches the state, so a broad pattern cannot
+drag the average toward zero.
 
 ## Rate limiting
 
@@ -443,6 +453,34 @@ Dropping instead of delaying has a price worth knowing: a dropped message
 reaches no rule at all, so a rule that keeps state - alert once, reset on
 close - does not see the change that arrived inside the window. Register a
 limit only where that trade is worth it.
+
+## Change detection
+
+A sensor that keeps republishing the same reading, or a poll that reads the
+same register twice, is not producing events - it is producing the *same*
+event. `changed(pattern)` turns that level into an edge: a matching topic is
+routed only when its payload differs from the last one that was routed, so a
+repeat is dropped before any handler sees it.
+
+```awk
+# rules/door.awk
+BEGIN {
+    changed("^home/door$")                 # only when the door state changes
+    reg("^home/door$", "door_handler", "turn the light on when the door opens")
+}
+```
+
+State is kept per exact topic - the same contract as `limit()` and `smooth()` -
+so `home/door` and `home/window` each carry their own last payload, and the
+first message on a topic always passes. `changed()` runs after the rate limiter,
+so a value the limiter dropped never counts as the change a rule was waiting
+for: only a message that would have reached a rule updates the edge. It is
+engine-wide and listed by `--list-rules` like the other stages.
+
+`changed()` is the in-engine counterpart of `--pipe --changed`, which de-dups a
+polled command's output at the source. Use the rule stage when the dedup belongs
+to a topic (any input, any rule file); use the flag when it belongs to one
+command and should never reach the engine at all.
 
 ## HTTP webhooks
 

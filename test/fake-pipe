@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# test/fake-pipe - a stand-in for the --pipe command.
+#
+# The mode comes from the environment, not argv, so the argument to --pipe
+# stays a single path that stdbuf and bash -c can run.
+#
+#   FAKE_PIPE_MODE=emit   FAKE_PIPE_COUNT lines, then stay alive (default)
+#   FAKE_PIPE_MODE=once   the same lines, then exit 0
+#   FAKE_PIPE_MODE=die    exit FAKE_PIPE_CODE (default 1) after a word on stderr
+#   FAKE_PIPE_MODE=flaky  exit FAKE_PIPE_CODE on the first FAKE_PIPE_FAIL runs
+#                         (the count is kept in FAKE_PIPE_STATE), then emit once
+#
+#   FAKE_PIPE_TOPIC    default pipe/x
+#   FAKE_PIPE_PAYLOAD  default hello
+#   FAKE_PIPE_COUNT    default 1
+#   FAKE_PIPE_CODE     default 1
+#   FAKE_PIPE_FAIL     default 1
+#   FAKE_PIPE_STATE    run-counter path, used by flaky
+
+set -u
+
+topic=${FAKE_PIPE_TOPIC:-pipe/x}
+payload=${FAKE_PIPE_PAYLOAD:-hello}
+count=${FAKE_PIPE_COUNT:-1}
+code=${FAKE_PIPE_CODE:-1}
+state=${FAKE_PIPE_STATE:-}
+
+emit() {
+    local i
+    for (( i = 1; i <= count; i++ )); do
+        printf '%s %s\n' "$topic" "$payload"
+    done
+}
+
+# exec, so no child holds the fifo open after a signal reaches us.
+hold() { exec sleep 3600; }
+
+case ${FAKE_PIPE_MODE:-emit} in
+emit)
+    emit
+    hold
+    ;;
+once)
+    emit
+    ;;
+die)
+    printf 'fake-pipe: dying on request\n' >&2
+    exit "$code"
+    ;;
+flaky)
+    n=0
+    [[ -n $state && -r $state ]] && read -r n < "$state"
+    n=$(( n + 1 ))
+    [[ -n $state ]] && printf '%s\n' "$n" > "$state"
+    if (( n <= ${FAKE_PIPE_FAIL:-1} )); then
+        printf 'fake-pipe: run %d failed\n' "$n" >&2
+        exit "$code"
+    fi
+    emit
+    ;;
+*)
+    printf 'fake-pipe: unknown mode %s\n' "${FAKE_PIPE_MODE:-}" >&2
+    exit 64
+    ;;
+esac
