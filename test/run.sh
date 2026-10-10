@@ -24,7 +24,7 @@ cd "$(dirname "$0")/.." || exit 1
 export MOSQ_SUB="$PWD/test/fake-mosquitto-sub"
 # Inputs are opt-in and each case names the ones it wants: a developer's .env
 # must not switch one on (or off) behind the suite's back.
-export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=8080 AWKRED_WEBHOOK=0
+export AWKRED_MQTT=0 AWKRED_TICK=0 AWKRED_HTTP_PORT=3737 AWKRED_WEBHOOK=0
 # The rate-limit test seam, pinned like the inputs: a value in a developer's
 # .env must not move a window behind the suite's back.
 export AWKRED_TEST_STEP=0

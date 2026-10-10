@@ -807,3 +807,46 @@ Roughly in order of value per effort:
 Developed and tested against gawk 5.1 and 5.3, mosquitto-clients 2.0,
 coreutils `stdbuf`, and bash 5.1. The engine needs gawk >= 4.0 for indirect
 calls and two-way coprocesses; the script needs bash >= 4.4 for `mapfile -d`.
+## Pub broker configuration (separate from subscription)
+
+Rules call `pub()` and `pub_retained()` to publish to an MQTT broker. The
+publish broker is configured separately so awk-red can act as a bridge or
+gateway without needing the input broker to be the same:
+
+- `MQTT_PUB_HOST` - publish broker host (default: `MQTT_HOST`)
+- `MQTT_PUB_PORT` - publish broker port (default: `MQTT_PORT`)
+- `MQTT_PUB_USER` - publish credentials (default: `MQTT_USER`)
+- `MQTT_PUB_PASS` - publish password (default: `MQTT_PASS`)
+- `MQTT_PUB_TLS`  - `1` enables TLS for publishes (default: `MQTT_TLS`)
+- `MQTT_PUB_CAFILE` - CA bundle for TLS (default: `MQTT_CAFILE`)
+- `MQTT_PUB_CLIENT_ID` - client id for publishes (default: `MQTT_CLIENT_ID`)
+
+If any `MQTT_PUB_*` is unset, it falls back to the corresponding `MQTT_*`
+value, so existing setups keep working unchanged. The subscription side
+(`--mqtt`) is never affected by publish broker settings.
+
+## Gateway mode (auto-publish unmatched messages)
+
+Gateway mode forwards input messages to the publish broker when no rule
+handles them. This lets awk-red act as a transparent bridge/gateway without
+writing any rules:
+
+- `--gateway` or `AWKRED_GATEWAY=1` enables gateway mode.
+- `--gateway` is not allowed with `--mqtt` unless a separate publish broker is
+  configured (`MQTT_PUB_HOST`/`MQTT_PUB_PORT` or their TLS/user/pass variants
+  differ from the subscription broker). In that case the MQTT input can run
+  alongside gateway auto-publish to a different broker.
+- When `--gateway` is enabled, `-r/--rules` is optional. An empty rule set is
+  permitted only in gateway mode; otherwise at least one `*.awk` rule file
+  must exist.
+- An "unmatched" message is one for which no rule matched the topic at all.
+  When enabled, such messages are auto-published unchanged: `pub(topic,payload)`.
+- Gateway behaviour applies to chained events as well (a chained event that
+  remains unmatched is auto-published).
+- Explicit rules can still match, transform, filter, `pub()`, `emit()` or
+  `chain()` as normal. Gateway only triggers when nothing matched, so rules
+  that act do not cause double-publishes.
+- Feedback loops are possible if the publish broker is the same as the source
+  and topics remain identical. Use separate `MQTT_PUB_*` settings or have
+  rules transform topics when needed.
+

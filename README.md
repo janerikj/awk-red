@@ -127,7 +127,7 @@ never committed.
 | `AWKRED_CHAIN_MAX` | `32` | maximum `chain()` hops before an event is dropped |
 | `AWKRED_TICK` | `0` | clock interval in seconds, `0` is off (`--tick`) |
 | `AWKRED_WEBHOOK` | `0` | `1` listens for HTTP webhooks (`--webhook`) |
-| `AWKRED_HTTP_PORT` | `8080` | HTTP listen port when webhooks are on (`-P`) |
+| `AWKRED_HTTP_PORT` | `3737` | HTTP listen port when webhooks are on (`-P`) |
 | `AWKRED_ENV` | `./.env` if present | env file to load (`-e`) |
 
 > [!NOTE]
@@ -161,7 +161,7 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
                      run is retried)
     --changed       with --pipe, drop a topic's repeated payloads
     --tick SECONDS  clock message on awk-red/tick/<timestamp> every SECONDS
--P, --http-port PORT   HTTP listen port when --webhook is on (default 8080)
+-P, --http-port PORT   HTTP listen port when --webhook is on (default 3737)
 -n, --dry-run       print commands instead of running them
 -l, --list-rules    list the loaded rules and exit
 -v, --verbose       log routing decisions to stderr
@@ -488,7 +488,7 @@ command and should never reach the engine at all.
 HTTP is another input a rule can react to, off unless asked for:
 `--webhook` (optionally with `-P PORT` or `AWKRED_HTTP_PORT`). It can be the
 whole input: `./awk-red -n --webhook` needs no subscription at all (`pub()` in a
-rule still sends to the configured broker).
+rule still sends to the configured broker; use `-P` to pick a different port).
 The listener binds all interfaces (there is no host option), so treat it like
 any other port you expose and firewall it accordingly.
 

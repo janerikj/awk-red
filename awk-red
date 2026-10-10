@@ -57,7 +57,7 @@ inputs (at least one is required):
       --tick SECONDS  a clock message on awk-red/tick/<timestamp> every SECONDS
                       (AWKRED_TICK, default 0 = off)
   -P, --http-port PORT  HTTP listen port when --webhook is on
-                      (AWKRED_HTTP_PORT, default 8080)
+                      (AWKRED_HTTP_PORT, default 3737)
 
 broker (for --mqtt and for pub() in every mode):
   -h, --host HOST     broker hostname                (MQTT_HOST,   default localhost)
@@ -85,7 +85,7 @@ precedence: command line > environment > .env > built-in default
 examples:
   $PROG -n -i examples/messages.log       dry run against a recording
   $PROG --mqtt -h mqtt.local -r ./rules   subscribe, with your own rules
-  $PROG --webhook -P 8080 -r ./rules       webhooks only, no broker needed
+  $PROG --webhook -P 3737 -r ./rules       webhooks only, no broker needed
   $PROG --tick 300 -r ./rules             clock only, no broker needed
   $PROG -l -r ./rules                     show what would handle what
 EOF
@@ -191,7 +191,7 @@ MQTT_TOPIC=${OPT_TOPIC:-${MQTT_TOPIC:-#}}
 RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-examples}}
 DRYRUN=${OPT_DRYRUN:-${DRYRUN:-0}}
 TICK=${OPT_TICK:-${AWKRED_TICK:-0}}
-HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-8080}}
+HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-3737}}
 PIPE_CMD=${OPT_PIPE:-${AWKRED_PIPE:-}}
 PIPE_EVERY=${OPT_EVERY:-${AWKRED_PIPE_EVERY:-0}}
 PIPE_CHANGED=${OPT_CHANGED:-${AWKRED_PIPE_CHANGED:-0}}
