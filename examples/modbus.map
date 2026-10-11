@@ -4,9 +4,8 @@
 # examples/modbus.sh for the columns; switch the topics to whatever your rules
 # expect.
 #
-#   slave  type      addr  count  fmt     topic
-#
-1        holding   100   1      int16   modbus/site1/temp
-1        input     1     1      int16   modbus/site1/status
-1        discrete  1     2      -       modbus/site1/alarm
-1        coil      1     1      -       modbus/site1/pump
+# slave  type      addr  count  fmt     topic
+1        holding   100   1      int16   modbus/site1/holding/level
+1        input     1     1      int16   modbus/site1/input/temp
+1        discrete  1     2      -       modbus/site1/discrete/alarm
+1        coil      1     1      -       modbus/site1/coil/pump
