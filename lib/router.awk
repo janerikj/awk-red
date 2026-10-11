@@ -419,7 +419,7 @@ BEGIN {
     LIST = envbool("AWKRED_LIST", "0")
     FIRST_MATCH = envbool("AWKRED_FIRST_MATCH", "0")
     GATEWAY = envbool("AWKRED_GATEWAY", "0")
-    RULES_DIR = getenv("AWKRED_RULES", "?")
+    RULES_DIR = getenv("AWKRED_RULES", "(none)")
 
     MQTT_HOST = getenv("MQTT_HOST", "localhost")
     MQTT_PORT = getenv("MQTT_PORT", "1883")

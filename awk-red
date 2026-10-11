@@ -24,7 +24,7 @@
 set -euo pipefail
 
 readonly PROG=awk-red
-readonly VERSION=v0.7.0
+readonly VERSION=v0.7.1
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     printf '%s: bash 4.4 or newer is required (found %s)\n' "$PROG" "$BASH_VERSION" >&2
@@ -68,8 +68,9 @@ broker (for --mqtt and for pub() in every mode):
                       CLIENT_ID, each falling back to the MQTT_* value
 
 options:
-  -r, --rules DIR     rule directory, *.awk loaded in sorted order
-                                                 (AWKRED_RULES, default examples)
+  -r, --rules DIR     rule directory, *.awk loaded in sorted order; with no
+                      -r and no AWKRED_RULES, no rules are loaded
+                                                     (AWKRED_RULES, default none)
   -e, --env FILE      env file to load           (AWKRED_ENV,  default ./.env)
       --every SECONDS  with --pipe, rerun CMD every SECONDS (a poll; the
                       command's failures are retried)
@@ -88,11 +89,12 @@ options:
 precedence: command line > environment > .env > built-in default
 
 examples:
-  $PROG -n -i examples/messages.log       dry run against a recording
+  $PROG -n -r examples -i examples/messages.log   dry run against a recording
   $PROG --mqtt -h mqtt.local -r ./rules   subscribe, with your own rules
   $PROG --webhook -P 3737 -r ./rules       webhooks only, no broker needed
   $PROG --tick 300 -r ./rules             clock only, no broker needed
   $PROG -l -r ./rules                     show what would handle what
+  $PROG --gateway -i recording.log        republish unmatched with no rules
 EOF
 }
 
@@ -197,7 +199,7 @@ done
 MQTT_HOST=${OPT_HOST:-${MQTT_HOST:-localhost}}
 MQTT_PORT=${OPT_PORT:-${MQTT_PORT:-1883}}
 MQTT_TOPIC=${OPT_TOPIC:-${MQTT_TOPIC:-#}}
-RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-examples}}
+RULES_DIR=${OPT_RULES:-${AWKRED_RULES:-}}
 DRYRUN=${OPT_DRYRUN:-${DRYRUN:-0}}
 TICK=${OPT_TICK:-${AWKRED_TICK:-0}}
 HTTP_PORT=${OPT_HTTP_PORT:-${AWKRED_HTTP_PORT:-3737}}
@@ -341,21 +343,22 @@ fi
 
 # ------------------------------------------------------------------ rules
 
-[[ -d $RULES_DIR ]] || die "rules directory not found: $RULES_DIR (see --rules)"
-
+# The rule directory has no default: the bundled examples are not loaded unless
+# asked for, because a real input can easily match an example rule and trigger a
+# publish nobody wanted. No rules at all is a legal run - gateway mode needs
+# none, and a run that only observes is allowed to do nothing.
+#
 # LC_ALL=C sort keeps the load order deterministic regardless of locale, and
-# -z keeps file names with spaces intact. An empty rule set is legal only in
-# gateway mode, where unmatched messages are republished with no rule at all.
-shopt -s nullglob
-rule_glob=( "$RULES_DIR"/*.awk )
-shopt -u nullglob
+# -z keeps file names with spaces intact.
 RULE_FILES=()
-if (( ${#rule_glob[@]} )); then
-    mapfile -d '' -t RULE_FILES < <(printf '%s\0' "${rule_glob[@]}" | LC_ALL=C sort -z)
-fi
-
-if (( ${#RULE_FILES[@]} == 0 && GATEWAY_ON == 0 )); then
-    die "no *.awk rule files in $RULES_DIR (see --rules, or --gateway to run without rules)"
+if [[ -n $RULES_DIR ]]; then
+    [[ -d $RULES_DIR ]] || die "rules directory not found: $RULES_DIR (see --rules)"
+    shopt -s nullglob
+    rule_glob=( "$RULES_DIR"/*.awk )
+    shopt -u nullglob
+    if (( ${#rule_glob[@]} )); then
+        mapfile -d '' -t RULE_FILES < <(printf '%s\0' "${rule_glob[@]}" | LC_ALL=C sort -z)
+    fi
 fi
 
 GAWK_OPTS=(-f "$ENGINE")
@@ -407,7 +410,11 @@ if [[ -z $OPT_QUIET ]]; then
     elif (( MQTT_ON )); then
         printf '  broker   %s:%s topic %s\n' "$MQTT_HOST" "$MQTT_PORT" "$MQTT_TOPIC" >&2
     fi
-    printf '  rules    %s (%d file(s))\n' "$RULES_DIR" "${#RULE_FILES[@]}" >&2
+    if [[ -n $RULES_DIR ]]; then
+        printf '  rules    %s (%d file(s))\n' "$RULES_DIR" "${#RULE_FILES[@]}" >&2
+    else
+        printf '  rules    (none)\n' >&2
+    fi
     if (( TICK > 0 )); then
         printf '  clock    every %d s, on topic awk-red/tick/<timestamp>\n' "$TICK" >&2
     fi

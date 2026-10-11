@@ -162,7 +162,7 @@ http_get() {
 case_replay_golden() {
     CASE="replay against a recording matches the golden output"
     local rc
-    "$AWKRED" -n -q -i examples/messages.log >"$OUT" 2>"$ERR"
+    "$AWKRED" -n -q -r examples -i examples/messages.log >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
     diff -u test/expected/messages.log.out "$OUT" >"$ERR" || bad "$(cat "$ERR")"
@@ -174,7 +174,7 @@ case_tick_offline() {
     CASE="a tick line in a recording routes to the heartbeat rule"
     local rc
     echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' \
-        | "$AWKRED" -n -q -i - >"$OUT" 2>"$ERR"
+        | "$AWKRED" -n -q -r examples -i - >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
     grep -qF -- "-t 'awk-red/heartbeat/2026-10-03T11:22:33Z' -m '1756899753'" "$OUT" \
@@ -185,7 +185,7 @@ case_tick_offline() {
 case_tick_off_by_default() {
     CASE="the clock is off unless asked for"
     local banner
-    banner=$("$AWKRED" -n -i examples/messages.log 2>&1 >/dev/null)
+    banner=$("$AWKRED" -n -r examples -i examples/messages.log 2>&1 >/dev/null)
     [[ $banner != *"clock"* ]] || bad "the banner mentions a clock without --tick"
     grep -qF '^awk-red/tick/' "$OUT" 2>/dev/null && bad "ticks appeared without --tick"
     pass "$CASE"
@@ -194,7 +194,7 @@ case_tick_off_by_default() {
 case_tick_on_silent_broker() {
     CASE="ticks arrive while the broker sends nothing"
     local rc
-    start_awkred -n -v --tick 1 --mqtt -h test.invalid
+    start_awkred -n -v -r examples --tick 1 --mqtt -h test.invalid
     sleep 3.2
     finish_awkred TERM
     rc=$?
@@ -292,7 +292,7 @@ case_buffering() {
     CASE="messages are not stuck in a buffer (stdbuf wiring)"
     export FAKE_SUB_MODE=buffered FAKE_SUB_COUNT=3
     export FAKE_SUB_TOPIC=home/door FAKE_SUB_PAYLOAD=open
-    start_awkred -n -q --mqtt -h test.invalid
+    start_awkred -n -q -r examples --mqtt -h test.invalid
     unset FAKE_SUB_MODE FAKE_SUB_COUNT FAKE_SUB_TOPIC FAKE_SUB_PAYLOAD
     sleep 2
     local lines
@@ -306,7 +306,7 @@ case_buffering() {
 case_stream_routes() {
     CASE="a live stream reaches the rules"
     FAKE_SUB_MODE=stream FAKE_SUB_COUNT=3 \
-        timeout 8 "$AWKRED" -n -v --mqtt -h test.invalid >"$OUT" 2>"$ERR"
+        timeout 8 "$AWKRED" -n -v -r examples --mqtt -h test.invalid >"$OUT" 2>"$ERR"
     local lines
     lines=$(grep -c 'route home/kitchen/temp' "$ERR")
     (( lines == 3 )) || bad "$lines of 3 messages routed, stderr: $(cat "$ERR")"
@@ -463,7 +463,7 @@ case_http_sigterm() {
 }
 case_list_rules() {
     CASE="every example rule is discovered"
-    "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    "$AWKRED" -l -r examples >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^awk-red/tick(/|$)' "$OUT" || bad "no heartbeat rule listed"
     grep -qF '7 rule(s), 2 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
     pass "$CASE"
@@ -636,10 +636,11 @@ case_gateway_chained() {
     pass "$CASE"
 }
 
-# An empty rule directory is a usage error normally and fine in gateway mode,
-# where there is nothing to match and everything is forwarded.
+# No rules is a legal run: an empty rule directory is fine with or without
+# gateway mode. With gateway the messages are forwarded; without it the run is
+# simply a no-op observer.
 case_gateway_empty_rules() {
-    CASE="an empty rule set is allowed only in gateway mode"
+    CASE="an empty rule set is a legal run"
     local rc emptydir="$WORK/empty-rules"
     mkdir -p "$emptydir"
     printf 'anything/goes x\n' \
@@ -648,10 +649,27 @@ case_gateway_empty_rules() {
     (( rc == 0 )) || bad "gateway with no rules gave exit $rc: $(cat "$ERR")"
     grep -qF -- "-t 'anything/goes' -m 'x'" "$OUT" \
         || bad "gateway did not forward with no rules: $(cat "$OUT")"
-    "$AWKRED" -n -q -r "$emptydir" -i examples/messages.log >"$OUT" 2>"$ERR"
+    printf 'anything/goes x\n' \
+        | "$AWKRED" -n -q -r "$emptydir" -i - >"$OUT" 2>"$ERR"
     rc=$?
-    (( rc == 1 )) || bad "no rules without gateway gave exit $rc"
-    grep -qF 'no *.awk rule files' "$ERR" || bad "no rule-set message: $(cat "$ERR")"
+    (( rc == 0 )) || bad "no rules without gateway gave exit $rc: $(cat "$ERR")"
+    [[ -s $OUT ]] && bad "a rule-less, gateway-less run produced output: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The bundled examples are not a default. A run with no -r must load no rules,
+# so a real message cannot trip an example rule and publish something nobody
+# asked for.
+case_no_default_rules() {
+    CASE="the examples are not loaded by default"
+    local rc
+    printf 'home/door open\nhome/kitchen/temp 34\n' \
+        | "$AWKRED" -n -q -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    [[ -s $OUT ]] && bad "default rules acted on real input: $(cat "$OUT")"
+    "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF 'nothing registered' "$OUT" || bad "default --list-rules lists rules: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -802,7 +820,7 @@ case_smooth_before_limit() {
 case_tick_only() {
     CASE="the clock alone runs with no broker input"
     local rc ticks
-    start_awkred -n -v --tick 1
+    start_awkred -n -v -r examples --tick 1
     sleep 2.5
     ticks=$(grep -c '^DRYRUN> ' "$OUT")
     (( ticks >= 2 )) || bad "only $ticks ticks in 2.5 s"
@@ -981,6 +999,7 @@ cases=(
     case_gateway_forwards
     case_gateway_chained
     case_gateway_empty_rules
+    case_no_default_rules
     case_gateway_mqtt_guard
     case_chain_inprocess
     case_chain_pipeline

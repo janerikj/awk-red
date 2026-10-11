@@ -1,15 +1,17 @@
 # Examples
 
-This directory is the default rule directory (`-r examples`), so the bundled
-rules work out of the box and double as a starting point for your own.
+This directory is not loaded by default. Point awk-red at it with
+`-r examples` (there is deliberately no default rule directory, so a live input
+cannot trigger an example rule by accident). The rules here double as a
+starting point for your own.
 
 ```shell
-./awk-red -l                        # what is in here
-./awk-red -n -i messages.log       # dry run against the recording
-./awk-red -v -i messages.log       # the same, with routing decisions logged
-./awk-red --tick 2                 # the clock alone, no broker needed
-./awk-red -n --mqtt -h mqtt.local  # live, dry run against a real broker
-./awk-red --mqtt -h mqtt.local --tick 2   # live, with a clock every 2 s
+./awk-red -l -r examples                 # what is in here
+./awk-red -n -r examples -i messages.log # dry run against the recording
+./awk-red -v -r examples -i messages.log # the same, with routing logged
+./awk-red -r examples --tick 2                 # the clock alone
+./awk-red -n -r examples --mqtt -h mqtt.local  # live, dry run against a broker
+./awk-red -r examples --mqtt -h mqtt.local --tick 2   # live, with a clock
 ```
 
 | File | Shows |

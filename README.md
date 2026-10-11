@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.7.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.7.1-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -65,21 +65,25 @@ calls `gawk` explicitly.
 ```shell
 git clone <this repo> && cd awk-red
 cp .env.example .env                     # set MQTT_HOST if you use a broker
-./awk-red -n -i examples/messages.log    # dry run against a recording
-./awk-red -l                             # what handles what
-./awk-red -n --tick 1                    # the clock alone, no broker needed
+./awk-red -n -r examples -i examples/messages.log  # dry run, bundled rules
+./awk-red -l -r examples                 # what handles what
+./awk-red -n -r examples --tick 1        # the clock alone, no broker needed
 ./awk-red -r ./rules --mqtt -h mqtt.local # live, with your own rules
 ```
 
-Try it against a real broker without writing a single rule:
+There is no default rule directory: without `-r` (or `AWKRED_RULES`) no rules
+are loaded, so a real input can never trip an example rule by accident. To
+watch the bundled examples against a real broker:
 
 ```shell
 # terminal 1
-./awk-red -n -v --mqtt
+./awk-red -n -v -r examples --mqtt
 # terminal 2
 mosquitto_pub -t home/kitchen/temp -m 33.5      # -> DRYRUN> ... alarm/temp/kitchen
 mosquitto_pub -t home/door -m open
 ```
+
+To bridge with no rules at all, use gateway mode (see *Gateway mode*).
 
 ## Layout
 
@@ -88,17 +92,16 @@ awk-red              the application: .env, flags, dependencies, rule discovery,
                      line buffering, process supervision
 lib/router.awk       the engine: dispatch table, side effects, JSON extraction,
                      smoothing, rate limits, change detection, chaining, logging
-examples/            default rule directory (--rules), plus a recorded stream
+examples/            bundled rules, loaded only with -r examples
 docs/design.md       why it is built this way, and what was tried instead
 .env.example         every configuration variable with its default
 ```
 
-There is no fixed `rules/` directory in the repository. `--rules DIR` points
-at any directory of `*.awk` files, which is what makes the examples and your
-own rules the same thing:
+`--rules DIR` points at any directory of `*.awk` files, which is what makes the
+examples and your own rules the same thing:
 
 ```shell
-./awk-red -r examples            # the bundled examples (default)
+./awk-red -r examples            # the bundled examples
 ./awk-red -r ./rules             # a directory next to the script
 ./awk-red -r /etc/awk-red/rules  # a system-wide set of rules
 ```
@@ -125,7 +128,7 @@ never committed.
 | `MQTT_PUB_TLS` / `MQTT_PUB_CAFILE` | `MQTT_TLS` / `MQTT_CAFILE` | publish TLS settings |
 | `MQTT_PUB_CLIENT_ID` | `MQTT_CLIENT_ID` | publish client id |
 | `DRYRUN` | `0` | `1` prints commands instead of running them |
-| `AWKRED_RULES` | `examples` | rule directory (`-r`) |
+| `AWKRED_RULES` | none | rule directory (`-r`); no rules if unset |
 | `AWKRED_FIRST_MATCH` | `0` | stop after the first matching rule |
 | `AWKRED_GATEWAY` | `0` | `1` republishes unmatched messages (`--gateway`) |
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
@@ -161,7 +164,8 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -h, --host HOST     broker hostname
 -p, --port PORT     broker port
 -t, --topic FILTER  subscription filter (default '#')
--r, --rules DIR     rule directory, *.awk loaded in sorted order
+-r, --rules DIR     rule directory, *.awk loaded in sorted order; omit for
+                     no rules (gateway mode needs none)
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
@@ -198,7 +202,9 @@ also accept `--name=value`.
 
 Rule files are loaded in sorted order, and that order is the order rules are
 tried in, so it is stable regardless of locale. All matching rules run unless
-`--first-match` is set.
+`--first-match` is set. Rules are optional: with no `-r` and no `AWKRED_RULES`,
+nothing is registered, which is a complete run in gateway mode and a
+do-nothing observer otherwise.
 
 ## Writing a rule
 
@@ -244,7 +250,7 @@ Every side effect goes through `emit()`, so `--dry-run` covers the whole
 system: commands are printed, not executed.
 
 ```shell
-./awk-red -n -i examples/messages.log
+./awk-red -n -r examples -i examples/messages.log
 ```
 
 ```plain
@@ -505,7 +511,8 @@ is forwarded and a matched one is owned by its rule; with an empty rule set,
 every message is forwarded, which is the "no rules at all" gateway.
 
 ```shell
-./awk-red --gateway --mqtt -h in.example -r /etc/awk-red/rules
+# forward everything that arrives on in.example to out.example, no rules
+MQTT_PUB_HOST=out.example ./awk-red --gateway --mqtt -h in.example
 ```
 
 * **A separate publish broker is required with `--mqtt`.** Forwarding an
@@ -514,11 +521,11 @@ every message is forwarded, which is the "no rules at all" gateway.
   publish broker differs from the subscription broker (any `MQTT_PUB_*` set to
   a different value). Set `MQTT_PUB_HOST`/`MQTT_PUB_PORT` (or a different
   user/pass/TLS) to make it a real bridge.
-* **Rules are optional.** An empty rule directory is a usage error normally,
-  but is allowed in gateway mode, because forwarding everything needs no rule.
-  Explicit rules still match, transform, filter, `pub()`, `emit()` or `chain()`
-  as usual - gateway only fires when nothing matched, so it never
-  double-publishes a message a rule already acted on.
+* **Rules are optional.** No rule directory is loaded unless `-r` or
+  `AWKRED_RULES` names one, which is what makes a rule-less gateway a
+  first-class run. Explicit rules still match, transform, filter, `pub()`,
+  `emit()` or `chain()` as usual - gateway only fires when nothing matched, so
+  it never double-publishes a message a rule already acted on.
 * **Chained events count too.** A `chain()` event that no rule matches is
   forwarded like an input message, through the same
   `json()`/`smooth()`/`limit()`/`changed()` pipeline.
@@ -621,10 +628,10 @@ what `stdbuf -oL` does.
 reproducible:
 
 ```shell
-./awk-red -n -v -i examples/messages.log      # what would happen
-./awk-red -v -i examples/messages.log         # what does happen
-mosquitto_sub -v -t '#' | tee recording.log   # record a real stream
-./awk-red -n -i recording.log                 # replay it
+./awk-red -n -v -r examples -i examples/messages.log   # what would happen
+./awk-red -v -r examples -i examples/messages.log      # what does happen
+mosquitto_sub -v -t '#' | tee recording.log            # record a real stream
+./awk-red -n -r ~/rules -i recording.log               # replay against rules
 ```
 
 A recording is one `topic payload` line per message - the format every input
@@ -666,7 +673,7 @@ The clock lives in the shell, not in AWK, so two things are worth knowing:
 so put the line in the file instead.
 
 ```shell
-echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
+echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -r examples -i -
 ```
 
 ## Running as a service
@@ -674,7 +681,7 @@ echo 'awk-red/tick/2026-10-03T11:22:33Z 1756899753' | ./awk-red -n -q -i -
 `examples/awk-red.service` is a systemd unit. The points that matter:
 
 * use `Restart=always` and `RestartSec=5`
-* pass `-r /etc/awk-red/rules` explicitly instead of relying on the default
+* pass `-r /etc/awk-red/rules` explicitly: there is no default rule directory
 * keep `-v` out of it and use `-q`, so the journal holds errors instead of one
   line per message
 * `Type=simple`, since the script runs in the foreground
@@ -701,11 +708,12 @@ with `-e /etc/awk-red/.env`. Do not commit it.
 add `--mqtt`, `--webhook`, `--tick` or `-i`. `-h`/`MQTT_HOST` only configure
 where a subscription would connect, they do not create one.
 
-**No output at all.** Check the input and the rules. For an MQTT input:
+**No output at all.** Check the input and the rules. There is no default rule
+directory, so a run without `-r` loads nothing; and for an MQTT input:
 
 ```shell
-./awk-red -l                      # are any rules loaded?
-./awk-red -v --mqtt -t 'home/#'   # does anything match the topic filter?
+./awk-red -l -r examples          # are any rules loaded?
+./awk-red -v -r examples --mqtt -t 'home/#'   # does anything match the filter?
 mosquitto_sub -v -t 'home/#'      # is anything published at all?
 ```
 
@@ -720,7 +728,7 @@ logged with `-v` - or you are running with `--dry-run`, in which case the
 
 **A rule throws a gawk error.** awk-red stops; that is deliberate, a broken
 rule should not silently swallow the stream. Run it against a recording to
-reproduce: `./awk-red -n -i examples/messages.log`.
+reproduce: `./awk-red -n -r examples -i examples/messages.log`.
 
 ## Tests
 
