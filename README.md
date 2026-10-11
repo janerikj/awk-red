@@ -165,7 +165,7 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -p, --port PORT     broker port
 -t, --topic FILTER  subscription filter (default '#')
 -r, --rules DIR     rule directory, *.awk loaded in sorted order; omit for
-                     no rules (gateway mode needs none)
+                     no rules (rules not required in gateway mode)
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
