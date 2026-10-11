@@ -74,8 +74,10 @@ The rule directory is a flag (`-r`), the files are sorted with `LC_ALL=C sort`
 so load order is identical on every machine, and a new rule never requires
 touching anything else. There is no default directory: the bundled `examples/`
 are never loaded unless named, because with a live input an example rule can
-easily match a real topic and act on it. No rules at all is a legal run - see
-*Gateway mode*.
+easily match a real topic and act on it. An empty rule set is permitted only in
+gateway mode, where unmatched (here, every) message is forwarded - see *Gateway
+mode*. `--list-rules` is exempt, because it reports what would load instead of
+running.
 
 ## Dispatch
 
@@ -839,10 +841,11 @@ writing any rules:
   configured (`MQTT_PUB_HOST`/`MQTT_PUB_PORT` or their TLS/user/pass variants
   differ from the subscription broker). In that case the MQTT input can run
   alongside gateway auto-publish to a different broker.
-- `-r/--rules` is optional. There is no default rule directory, so a run with
-  no rules is always legal: every input message is unmatched, and in gateway
-  mode every one is forwarded. The bundled `examples/` are loaded only when
-  named with `-r examples`.
+- `-r/--rules` is required unless `--gateway` is set: a rule-less run outside
+  gateway mode would silently discard every message. In gateway mode an empty
+  rule set is legal, and then every input message is unmatched and forwarded.
+  `--list-rules` is exempt, since it reports what would load instead of running.
+  The bundled `examples/` are loaded only when named with `-r examples`.
 - An "unmatched" message is one for which no rule matched the topic at all.
   When enabled, such messages are auto-published unchanged: `pub(topic,payload)`.
 - Gateway behaviour applies to chained events as well (a chained event that

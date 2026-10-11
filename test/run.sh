@@ -210,7 +210,7 @@ case_tick_on_silent_broker() {
 case_deny_no_tick() {
     CASE="a refused subscription exits 5 without a clock"
     local rc
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt -h test.invalid >"$OUT" 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n -r examples --mqtt -h test.invalid >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
     grep -qF 'mosquitto_sub exited with status 5' "$ERR" || bad "stderr explains nothing: $(cat "$ERR")"
@@ -224,7 +224,7 @@ case_deny_no_tick() {
 case_deny_with_tick() {
     CASE="a refused subscription exits 5 with a clock (regression)"
     local rc
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n -r examples --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
     assert_no_strays
@@ -234,7 +234,7 @@ case_deny_with_tick() {
 case_die_with_tick() {
     CASE="a subscriber that fails outright exits with its status"
     local rc
-    FAKE_SUB_MODE=die FAKE_SUB_CODE=3 timeout 15 "$AWKRED" -n --mqtt -h test.invalid --tick 1 \
+    FAKE_SUB_MODE=die FAKE_SUB_CODE=3 timeout 15 "$AWKRED" -n -r examples --mqtt -h test.invalid --tick 1 \
         >"$OUT" 2>"$ERR"
     rc=$?
     (( rc == 3 )) || bad "exit $rc (124 means it hung), stderr: $(cat "$ERR")"
@@ -245,7 +245,7 @@ case_die_with_tick() {
 case_sigterm() {
     CASE="SIGTERM stops everything and exits 0"
     local rc
-    start_awkred -n --mqtt -h test.invalid --tick 1
+    start_awkred -n -r examples --mqtt -h test.invalid --tick 1
     sleep 2.5
     finish_awkred TERM
     rc=$?
@@ -261,7 +261,7 @@ case_sigterm() {
 case_sigint() {
     CASE="Ctrl-C stops everything and exits 0"
     timeout --preserve-status --signal=INT --kill-after=3 3 \
-        "$AWKRED" -n --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
+        "$AWKRED" -n -r examples --mqtt -h test.invalid --tick 1 >"$OUT" 2>"$ERR"
     local rc=$?
     case $rc in
     0) ;;
@@ -275,7 +275,7 @@ case_sigint() {
 case_signal_without_tick() {
     CASE="a plain SIGTERM during a normal run exits 0"
     local rc
-    start_awkred -n --mqtt -h test.invalid
+    start_awkred -n -r examples --mqtt -h test.invalid
     sleep 1.5
     finish_awkred TERM
     rc=$?
@@ -373,7 +373,7 @@ case_help_and_version() {
 case_http_off_by_default() {
     CASE="http is off by default"
     local banner
-    banner=$("$AWKRED" -n -q -i examples/messages.log 2>&1 >/dev/null)
+    banner=$("$AWKRED" -n -r examples -q -i examples/messages.log 2>&1 >/dev/null)
     [[ $banner != *"http"* ]] || bad "the banner mentions http without --webhook"
     pass "$CASE"
 }
@@ -429,7 +429,7 @@ case_http_port_taken() {
     fi
     # The preflight must fail fast and exit 1. If anything makes awk-red go
     # live instead, timeout keeps the suite from hanging forever on it.
-    timeout 15 "$AWKRED" -n -q --webhook -P "$port" >/dev/null 2>"$ERR"
+    timeout 15 "$AWKRED" -n -q -r examples --webhook -P "$port" >/dev/null 2>"$ERR"
     rc=$?
     kill $occup 2>/dev/null; wait $occup 2>/dev/null
     (( rc == 1 )) || bad "exit $rc (expected 1), stderr: $(cat "$ERR")"
@@ -442,7 +442,7 @@ case_http_deny() {
     CASE="http with refused subscription exits 5 without hang"
     local rc port
     port=$((22000 + RANDOM % 10000))
-    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n --mqtt --webhook -P "$port" -h test.invalid >/dev/null 2>"$ERR"
+    FAKE_SUB_MODE=deny timeout 15 "$AWKRED" -n -r examples --mqtt --webhook -P "$port" -h test.invalid >/dev/null 2>"$ERR"
     rc=$?
     (( rc == 5 )) || bad "exit $rc (124 means hung), stderr: $(cat "$ERR")"
     assert_no_strays
@@ -453,7 +453,7 @@ case_http_sigterm() {
     CASE="http listener stops cleanly on SIGTERM"
     local rc port
     port=$((23000 + RANDOM % 10000))
-    start_awkred -n --webhook -P "$port"
+    start_awkred -n -r examples --webhook -P "$port"
     sleep 1.0
     finish_awkred TERM
     rc=$?
@@ -636,11 +636,11 @@ case_gateway_chained() {
     pass "$CASE"
 }
 
-# No rules is a legal run: an empty rule directory is fine with or without
-# gateway mode. With gateway the messages are forwarded; without it the run is
-# simply a no-op observer.
+# An empty rule set is allowed only in gateway mode, where forwarding everything
+# is the whole job. Without gateway it is refused, because it would silently
+# discard the stream.
 case_gateway_empty_rules() {
-    CASE="an empty rule set is a legal run"
+    CASE="an empty rule set is allowed only in gateway mode"
     local rc emptydir="$WORK/empty-rules"
     mkdir -p "$emptydir"
     printf 'anything/goes x\n' \
@@ -652,23 +652,23 @@ case_gateway_empty_rules() {
     printf 'anything/goes x\n' \
         | "$AWKRED" -n -q -r "$emptydir" -i - >"$OUT" 2>"$ERR"
     rc=$?
-    (( rc == 0 )) || bad "no rules without gateway gave exit $rc: $(cat "$ERR")"
-    [[ -s $OUT ]] && bad "a rule-less, gateway-less run produced output: $(cat "$OUT")"
+    (( rc == 2 )) || bad "no rules without gateway gave exit $rc: $(cat "$ERR")"
+    grep -qF 'no *.awk rule files to load' "$ERR" || bad "no-rule message missing: $(cat "$ERR")"
     pass "$CASE"
 }
 
-# The bundled examples are not a default. A run with no -r must load no rules,
-# so a real message cannot trip an example rule and publish something nobody
-# asked for.
+# The bundled examples are not a default. A run with no -r and no gateway is
+# refused rather than silently discarding the stream; -l is exempt so it can
+# report that nothing would load.
 case_no_default_rules() {
-    CASE="the examples are not loaded by default"
+    CASE="the examples are not loaded, and a rule-less run is refused"
     local rc
-    printf 'home/door open\nhome/kitchen/temp 34\n' \
-        | "$AWKRED" -n -q -i - >"$OUT" 2>"$ERR"
+    "$AWKRED" -n -q -i examples/messages.log >"$OUT" 2>"$ERR"
     rc=$?
-    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
-    [[ -s $OUT ]] && bad "default rules acted on real input: $(cat "$OUT")"
+    (( rc == 2 )) || bad "rule-less default run gave exit $rc: $(cat "$ERR")"
+    grep -qF 'no *.awk rule files to load' "$ERR" || bad "no-rule message missing: $(cat "$ERR")"
     "$AWKRED" -l >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF 'rules from (none)' "$OUT" || bad "default --list-rules header wrong: $(cat "$OUT")"
     grep -qF 'nothing registered' "$OUT" || bad "default --list-rules lists rules: $(cat "$OUT")"
     pass "$CASE"
 }
@@ -839,7 +839,7 @@ case_http_death() {
     CASE="a killed http listener ends the run with its status"
     local rc port listener
     port=$((24000 + RANDOM % 10000))
-    start_awkred -n --webhook -P "$port"
+    start_awkred -n -r examples --webhook -P "$port"
     sleep 1.0
     listener=$(pgrep -g "$RUN_PID" -f 'lib/http\.awk' | head -n 1)
     if [[ -z $listener ]]; then

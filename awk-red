@@ -24,7 +24,7 @@
 set -euo pipefail
 
 readonly PROG=awk-red
-readonly VERSION=v0.7.1
+readonly VERSION=v0.7.2
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     printf '%s: bash 4.4 or newer is required (found %s)\n' "$PROG" "$BASH_VERSION" >&2
@@ -68,8 +68,8 @@ broker (for --mqtt and for pub() in every mode):
                       CLIENT_ID, each falling back to the MQTT_* value
 
 options:
-  -r, --rules DIR     rule directory, *.awk loaded in sorted order; with no
-                      -r and no AWKRED_RULES, no rules are loaded
+  -r, --rules DIR     rule directory, *.awk loaded in sorted order; required
+                      unless --gateway (or --list-rules)
                                                      (AWKRED_RULES, default none)
   -e, --env FILE      env file to load           (AWKRED_ENV,  default ./.env)
       --every SECONDS  with --pipe, rerun CMD every SECONDS (a poll; the
@@ -345,8 +345,9 @@ fi
 
 # The rule directory has no default: the bundled examples are not loaded unless
 # asked for, because a real input can easily match an example rule and trigger a
-# publish nobody wanted. No rules at all is a legal run - gateway mode needs
-# none, and a run that only observes is allowed to do nothing.
+# publish nobody wanted. A run with no rules does nothing but forward, so an
+# empty rule set is allowed only in gateway mode (--list-rules is exempt: it
+# reports what would load instead of running).
 #
 # LC_ALL=C sort keeps the load order deterministic regardless of locale, and
 # -z keeps file names with spaces intact.
@@ -359,6 +360,10 @@ if [[ -n $RULES_DIR ]]; then
     if (( ${#rule_glob[@]} )); then
         mapfile -d '' -t RULE_FILES < <(printf '%s\0' "${rule_glob[@]}" | LC_ALL=C sort -z)
     fi
+fi
+
+if (( ${#RULE_FILES[@]} == 0 && ! GATEWAY_ON && ! OPT_LIST )); then
+    usage_error "no *.awk rule files to load: pass -r DIR, or --gateway to run without rules"
 fi
 
 GAWK_OPTS=(-f "$ENGINE")

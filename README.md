@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.7.1-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.7.2-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -72,8 +72,11 @@ cp .env.example .env                     # set MQTT_HOST if you use a broker
 ```
 
 There is no default rule directory: without `-r` (or `AWKRED_RULES`) no rules
-are loaded, so a real input can never trip an example rule by accident. To
-watch the bundled examples against a real broker:
+are loaded, so a real input can never trip an example rule by accident. Because
+a rule-less run that neither forwards nor lists would just discard the stream,
+that state is refused: name rules with `-r`, or add `--gateway` to forward
+(`-l` is exempt, it only lists). To watch the bundled examples against a real
+broker:
 
 ```shell
 # terminal 1
@@ -128,7 +131,7 @@ never committed.
 | `MQTT_PUB_TLS` / `MQTT_PUB_CAFILE` | `MQTT_TLS` / `MQTT_CAFILE` | publish TLS settings |
 | `MQTT_PUB_CLIENT_ID` | `MQTT_CLIENT_ID` | publish client id |
 | `DRYRUN` | `0` | `1` prints commands instead of running them |
-| `AWKRED_RULES` | none | rule directory (`-r`); no rules if unset |
+| `AWKRED_RULES` | none | rule directory (`-r`); no default, no rules if unset |
 | `AWKRED_FIRST_MATCH` | `0` | stop after the first matching rule |
 | `AWKRED_GATEWAY` | `0` | `1` republishes unmatched messages (`--gateway`) |
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
@@ -164,8 +167,8 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -h, --host HOST     broker hostname
 -p, --port PORT     broker port
 -t, --topic FILTER  subscription filter (default '#')
--r, --rules DIR     rule directory, *.awk loaded in sorted order; omit for
-                     no rules (rules not required in gateway mode)
+-r, --rules DIR     rule directory, *.awk loaded in sorted order; required
+                     unless --gateway or --list-rules
 -e, --env FILE      env file to load
 -i, --input FILE    read messages from FILE ('-' = stdin) instead of live inputs
     --mqtt          subscribe to the broker (-h/-p above configure it)
@@ -202,9 +205,9 @@ also accept `--name=value`.
 
 Rule files are loaded in sorted order, and that order is the order rules are
 tried in, so it is stable regardless of locale. All matching rules run unless
-`--first-match` is set. Rules are optional: with no `-r` and no `AWKRED_RULES`,
-nothing is registered, which is a complete run in gateway mode and a
-do-nothing observer otherwise.
+`--first-match` is set. There is no default rule directory, and a run with no
+rules is refused unless it forwards (`--gateway`) or only lists (`-l`), so a
+forgotten `-r` fails loudly instead of silently discarding the stream.
 
 ## Writing a rule
 
@@ -521,11 +524,13 @@ MQTT_PUB_HOST=out.example ./awk-red --gateway --mqtt -h in.example
   publish broker differs from the subscription broker (any `MQTT_PUB_*` set to
   a different value). Set `MQTT_PUB_HOST`/`MQTT_PUB_PORT` (or a different
   user/pass/TLS) to make it a real bridge.
-* **Rules are optional.** No rule directory is loaded unless `-r` or
-  `AWKRED_RULES` names one, which is what makes a rule-less gateway a
-  first-class run. Explicit rules still match, transform, filter, `pub()`,
-  `emit()` or `chain()` as usual - gateway only fires when nothing matched, so
-  it never double-publishes a message a rule already acted on.
+* **An empty rule set is allowed only here.** A rule-less run with no gateway
+  would just discard the stream, so awk-red refuses it; `--gateway` is what
+  makes "no rules" a purposeful run - every unmatched message is forwarded, and
+  with no rules at all that is everything. Explicit rules still match,
+  transform, filter, `pub()`, `emit()` or `chain()` as usual - gateway only
+  fires when nothing matched, so it never double-publishes a message a rule
+  already acted on.
 * **Chained events count too.** A `chain()` event that no rule matches is
   forwarded like an input message, through the same
   `json()`/`smooth()`/`limit()`/`changed()` pipeline.
@@ -708,8 +713,12 @@ with `-e /etc/awk-red/.env`. Do not commit it.
 add `--mqtt`, `--webhook`, `--tick` or `-i`. `-h`/`MQTT_HOST` only configure
 where a subscription would connect, they do not create one.
 
-**No output at all.** Check the input and the rules. There is no default rule
-directory, so a run without `-r` loads nothing; and for an MQTT input:
+**It exits immediately with `no *.awk rule files to load`.** There is no default
+rule directory, and a rule-less run that neither forwards nor lists is refused
+as a usage error, so a forgotten `-r` fails loudly. Pass `-r DIR`, or
+`--gateway` to forward with no rules.
+
+**No output at all.** Check the input and the rules. For an MQTT input:
 
 ```shell
 ./awk-red -l -r examples          # are any rules loaded?
