@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.6.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.7.0-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -120,9 +120,14 @@ never committed.
 | `MQTT_CAFILE` | system CA bundle | CA bundle used when TLS is on |
 | `MQTT_CLIENT_ID` | empty | client id, useful in broker logs |
 | `MQTT_TOPIC` | `#` | subscription filter (`-t`) |
+| `MQTT_PUB_HOST` / `MQTT_PUB_PORT` | `MQTT_HOST` / `MQTT_PORT` | publish broker, for bridging |
+| `MQTT_PUB_USER` / `MQTT_PUB_PASS` | `MQTT_USER` / `MQTT_PASS` | publish credentials |
+| `MQTT_PUB_TLS` / `MQTT_PUB_CAFILE` | `MQTT_TLS` / `MQTT_CAFILE` | publish TLS settings |
+| `MQTT_PUB_CLIENT_ID` | `MQTT_CLIENT_ID` | publish client id |
 | `DRYRUN` | `0` | `1` prints commands instead of running them |
 | `AWKRED_RULES` | `examples` | rule directory (`-r`) |
 | `AWKRED_FIRST_MATCH` | `0` | stop after the first matching rule |
+| `AWKRED_GATEWAY` | `0` | `1` republishes unmatched messages (`--gateway`) |
 | `AWKRED_VERBOSE` | `0` | log routing decisions |
 | `AWKRED_CHAIN_MAX` | `32` | maximum `chain()` hops before an event is dropped |
 | `AWKRED_TICK` | `0` | clock interval in seconds, `0` is off (`--tick`) |
@@ -136,6 +141,12 @@ never committed.
 The `MQTT_*` variables configure the broker connection for `--mqtt` and for
 `pub()` in every mode, but setting them never switches the subscription on:
 that is `--mqtt` or `AWKRED_MQTT=1`. A run without any input is a usage error.
+
+`pub()` and `pub_retained()` can publish to a broker of their own: set any
+`MQTT_PUB_*` variable and it overrides the matching `MQTT_*` value for
+publishes only, leaving the subscription untouched. That is what makes awk-red
+a bridge between two brokers. Unset `MQTT_PUB_*` values fall back to their
+`MQTT_*` counterpart, so existing setups are unchanged.
 
 A password reaches the broker clients as a command-line argument, so it is
 visible in `ps` to other users on the machine. On a shared host, connect over
@@ -167,6 +178,8 @@ Live mode executes actions. Use `--dry-run` whenever you are not sure.
 -v, --verbose       log routing decisions to stderr
 -q, --quiet         only report errors
     --first-match   stop after the first matching rule
+    --gateway       republish messages no rule matched (rules optional; with
+                     --mqtt a separate MQTT_PUB_* broker is required)
 -?, --help          show help
     --version       show version
 ```
@@ -482,6 +495,33 @@ engine-wide and listed by `--list-rules` like the other stages.
 polled command's output at the source. Use the rule stage when the dedup belongs
 to a topic (any input, any rule file); use the flag when it belongs to one
 command and should never reach the engine at all.
+
+## Gateway mode
+
+`--gateway` (or `AWKRED_GATEWAY=1`) turns awk-red into a transparent bridge:
+when no rule matches an input message, the engine republishes it unchanged to
+the publish broker with `pub(topic, payload)`. With rules, an unmatched message
+is forwarded and a matched one is owned by its rule; with an empty rule set,
+every message is forwarded, which is the "no rules at all" gateway.
+
+```shell
+./awk-red --gateway --mqtt -h in.example -r /etc/awk-red/rules
+```
+
+* **A separate publish broker is required with `--mqtt`.** Forwarding an
+  unmatched message back to the broker it arrived from is a feedback loop for
+  every unmatched topic, so awk-red refuses `--gateway --mqtt` unless the
+  publish broker differs from the subscription broker (any `MQTT_PUB_*` set to
+  a different value). Set `MQTT_PUB_HOST`/`MQTT_PUB_PORT` (or a different
+  user/pass/TLS) to make it a real bridge.
+* **Rules are optional.** An empty rule directory is a usage error normally,
+  but is allowed in gateway mode, because forwarding everything needs no rule.
+  Explicit rules still match, transform, filter, `pub()`, `emit()` or `chain()`
+  as usual - gateway only fires when nothing matched, so it never
+  double-publishes a message a rule already acted on.
+* **Chained events count too.** A `chain()` event that no rule matches is
+  forwarded like an input message, through the same
+  `json()`/`smooth()`/`limit()`/`changed()` pipeline.
 
 ## HTTP webhooks
 

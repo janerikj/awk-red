@@ -807,7 +807,7 @@ Roughly in order of value per effort:
 Developed and tested against gawk 5.1 and 5.3, mosquitto-clients 2.0,
 coreutils `stdbuf`, and bash 5.1. The engine needs gawk >= 4.0 for indirect
 calls and two-way coprocesses; the script needs bash >= 4.4 for `mapfile -d`.
-## Pub broker configuration (separate from subscription)
+## Pub broker configuration (built in v0.7.0)
 
 Rules call `pub()` and `pub_retained()` to publish to an MQTT broker. The
 publish broker is configured separately so awk-red can act as a bridge or
@@ -825,7 +825,7 @@ If any `MQTT_PUB_*` is unset, it falls back to the corresponding `MQTT_*`
 value, so existing setups keep working unchanged. The subscription side
 (`--mqtt`) is never affected by publish broker settings.
 
-## Gateway mode (auto-publish unmatched messages)
+## Gateway mode (built in v0.7.0)
 
 Gateway mode forwards input messages to the publish broker when no rule
 handles them. This lets awk-red act as a transparent bridge/gateway without

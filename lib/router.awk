@@ -292,8 +292,18 @@ function route(topic, payload,    i, hits, fn) {
                 return hits
         }
     }
-    if (hits == 0)
-        debug("no rule matched " topic)
+    if (hits == 0) {
+        if (GATEWAY) {
+            # Gateway mode: an unmatched message is forwarded unchanged to the
+            # publish broker, so awk-red bridges without any rule. A message
+            # that matched is never republished here - the rule owns it - so an
+            # acting rule and the gateway cannot double-publish.
+            debug("gateway " topic " (" payload ")")
+            pub(topic, payload)
+        } else {
+            debug("no rule matched " topic)
+        }
+    }
     return hits
 }
 
@@ -364,14 +374,20 @@ function drain(    t, p, h) {
 
 # -------------------------------------------------------------------- setup
 
+# Publish broker connection, built from MQTT_PUB_* with a fallback to the
+# subscription's MQTT_* (see docs/design.md, "Pub broker configuration"). Each
+# value is resolved once here, so a bridge between two brokers is pure
+# configuration and rules never see the difference.
 function build_pub_cmd(    cmd) {
-    cmd = "mosquitto_pub -h " shquote(MQTT_HOST) " -p " shquote(MQTT_PORT)
-    if (MQTT_USER != "")
-        cmd = cmd " -u " shquote(MQTT_USER)
-    if (MQTT_PASS != "")
-        cmd = cmd " -P " shquote(MQTT_PASS)
-    if (MQTT_TLS)
-        cmd = cmd " --cafile " shquote(MQTT_CAFILE != "" ? MQTT_CAFILE : CA_BUNDLE)
+    cmd = "mosquitto_pub -h " shquote(PUB_HOST) " -p " shquote(PUB_PORT)
+    if (PUB_USER != "")
+        cmd = cmd " -u " shquote(PUB_USER)
+    if (PUB_PASS != "")
+        cmd = cmd " -P " shquote(PUB_PASS)
+    if (PUB_TLS)
+        cmd = cmd " --cafile " shquote(PUB_CAFILE != "" ? PUB_CAFILE : CA_BUNDLE)
+    if (PUB_CLIENT_ID != "")
+        cmd = cmd " -i " shquote(PUB_CLIENT_ID)
     return cmd
 }
 
@@ -402,6 +418,7 @@ BEGIN {
     QUIET = envbool("AWKRED_QUIET", "0")
     LIST = envbool("AWKRED_LIST", "0")
     FIRST_MATCH = envbool("AWKRED_FIRST_MATCH", "0")
+    GATEWAY = envbool("AWKRED_GATEWAY", "0")
     RULES_DIR = getenv("AWKRED_RULES", "?")
 
     MQTT_HOST = getenv("MQTT_HOST", "localhost")
@@ -410,6 +427,18 @@ BEGIN {
     MQTT_PASS = getenv("MQTT_PASS", "")
     MQTT_TLS = envbool("MQTT_TLS", "0")
     MQTT_CAFILE = getenv("MQTT_CAFILE", "")
+    MQTT_CLIENT_ID = getenv("MQTT_CLIENT_ID", "")
+
+    # Publish broker. Every MQTT_PUB_* falls back to its MQTT_* counterpart, so
+    # an existing single-broker setup is unchanged; setting any of them points
+    # pub() at a different broker without touching the subscription.
+    PUB_HOST = getenv("MQTT_PUB_HOST", MQTT_HOST)
+    PUB_PORT = getenv("MQTT_PUB_PORT", MQTT_PORT)
+    PUB_USER = getenv("MQTT_PUB_USER", MQTT_USER)
+    PUB_PASS = getenv("MQTT_PUB_PASS", MQTT_PASS)
+    PUB_CAFILE = getenv("MQTT_PUB_CAFILE", MQTT_CAFILE)
+    PUB_CLIENT_ID = getenv("MQTT_PUB_CLIENT_ID", MQTT_CLIENT_ID)
+    PUB_TLS = (getenv("MQTT_PUB_TLS", "") != "") ? envbool("MQTT_PUB_TLS", "0") : MQTT_TLS
 
     PUB_CMD = build_pub_cmd()
     CLOCK_STEP = getenv("AWKRED_TEST_STEP", "0") + 0

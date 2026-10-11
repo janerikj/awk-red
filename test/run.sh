@@ -563,6 +563,113 @@ case_split_recipe() {
     pass "$CASE"
 }
 
+# A publish broker of its own: MQTT_PUB_* overrides MQTT_* for pub() and
+# pub_retained(), leaving the subscription settings alone, so awk-red can
+# bridge two brokers. Both publishers must pick up every override.
+case_pub_broker_override() {
+    CASE="MQTT_PUB_* overrides MQTT_* for pub()"
+    local rc
+    printf 'pub/all hi\n' \
+        | MQTT_HOST=sub.example MQTT_PORT=1884 MQTT_USER=su MQTT_PASS=sp \
+          MQTT_TLS=0 MQTT_PUB_HOST=pub.example MQTT_PUB_PORT=8883 \
+          MQTT_PUB_USER=pu MQTT_PUB_PASS=pp MQTT_PUB_TLS=1 \
+          MQTT_PUB_CAFILE=/tmp/pub-ca.pem MQTT_PUB_CLIENT_ID=pubber \
+          "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "mosquitto_pub -h 'pub.example' -p '8883' -u 'pu' -P 'pp' --cafile '/tmp/pub-ca.pem' -i 'pubber' -t 'pub/out' -m 'hi'" "$OUT" \
+        || bad "pub() did not use the publish broker: $(cat "$OUT")"
+    grep -qF "mosquitto_pub -h 'pub.example' -p '8883' -u 'pu' -P 'pp' --cafile '/tmp/pub-ca.pem' -i 'pubber' -r -t 'pub/out' -m 'hi'" "$OUT" \
+        || bad "pub_retained() did not use the publish broker: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# With no MQTT_PUB_* at all, pub() uses the subscription settings, so an
+# existing single-broker setup is unchanged. The empty overrides pin the
+# fallback against a developer's .env.
+case_pub_broker_fallback() {
+    CASE="pub() falls back to the MQTT_* settings"
+    local rc
+    printf 'pub/all hi\n' \
+        | MQTT_HOST=sub.example MQTT_PORT=1884 MQTT_USER=su MQTT_PASS=sp \
+          MQTT_TLS=0 MQTT_CLIENT_ID=sid \
+          MQTT_PUB_HOST= MQTT_PUB_PORT= MQTT_PUB_USER= MQTT_PUB_PASS= \
+          MQTT_PUB_TLS= MQTT_PUB_CAFILE= MQTT_PUB_CLIENT_ID= \
+          "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "mosquitto_pub -h 'sub.example' -p '1884' -u 'su' -P 'sp' -i 'sid' -t 'pub/out' -m 'hi'" "$OUT" \
+        || bad "pub() did not fall back to MQTT_*: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# Gateway mode forwards a message no rule matched, unchanged, and never touches
+# one a rule handled - the rule owns it, so there is no double-publish.
+case_gateway_forwards() {
+    CASE="gateway republishes only unmatched messages"
+    local rc
+    printf 'gateway/loose hi\nedge/x on\n' \
+        | MQTT_TLS=0 "$AWKRED" -n -q --gateway -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF -- "-t 'gateway/loose' -m 'hi'" "$OUT" \
+        || bad "the unmatched message was not forwarded: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo edge 'edge/x=on'" "$OUT" \
+        || bad "the matched rule did not run: $(cat "$OUT")"
+    [[ $(grep -c '^DRYRUN> mosquitto_pub ' "$OUT") == 1 ]] \
+        || bad "expected exactly 1 forwarded publish, got: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# A chained event goes through the same pipeline, so an unmatched chained event
+# is forwarded too. chain/orphan chains to chain/unmatched, which no rule
+# handles.
+case_gateway_chained() {
+    CASE="gateway forwards an unmatched chained event"
+    local rc
+    printf 'chain/orphan hi\n' \
+        | MQTT_TLS=0 "$AWKRED" -n -q --gateway -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF -- "-t 'chain/unmatched' -m 'hi'" "$OUT" \
+        || bad "the chained event was not forwarded: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# An empty rule directory is a usage error normally and fine in gateway mode,
+# where there is nothing to match and everything is forwarded.
+case_gateway_empty_rules() {
+    CASE="an empty rule set is allowed only in gateway mode"
+    local rc emptydir="$WORK/empty-rules"
+    mkdir -p "$emptydir"
+    printf 'anything/goes x\n' \
+        | MQTT_TLS=0 "$AWKRED" -n -q --gateway -r "$emptydir" -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "gateway with no rules gave exit $rc: $(cat "$ERR")"
+    grep -qF -- "-t 'anything/goes' -m 'x'" "$OUT" \
+        || bad "gateway did not forward with no rules: $(cat "$OUT")"
+    "$AWKRED" -n -q -r "$emptydir" -i examples/messages.log >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 1 )) || bad "no rules without gateway gave exit $rc"
+    grep -qF 'no *.awk rule files' "$ERR" || bad "no rule-set message: $(cat "$ERR")"
+    pass "$CASE"
+}
+
+# --gateway --mqtt needs a publish broker of its own, or every unmatched
+# message loops back to the broker it came from.
+case_gateway_mqtt_guard() {
+    CASE="gateway with --mqtt requires a separate publish broker"
+    local rc
+    "$AWKRED" --gateway --mqtt -l >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 2 )) || bad "same-broker gateway+mqtt gave exit $rc"
+    grep -qF 'separate publish broker' "$ERR" || bad "guard message missing: $(cat "$ERR")"
+    MQTT_PUB_HOST=pub.example "$AWKRED" --gateway --mqtt -l >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "gateway+mqtt with a second broker gave exit $rc: $(cat "$ERR")"
+    pass "$CASE"
+}
+
 # chain() keeps the event in the process: the chained rules run with no broker
 # at all, and only the eventual emit() is visible. A payload that triggered no
 # rule looks like a broken test, so both fields have a handler.
@@ -869,6 +976,12 @@ cases=(
     case_smooth_before_limit
     case_json_stream
     case_split_recipe
+    case_pub_broker_override
+    case_pub_broker_fallback
+    case_gateway_forwards
+    case_gateway_chained
+    case_gateway_empty_rules
+    case_gateway_mqtt_guard
     case_chain_inprocess
     case_chain_pipeline
     case_chain_loop_guard

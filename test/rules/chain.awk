@@ -16,6 +16,10 @@ BEGIN {
 
     # Self-matching on purpose: exercises the hop guard instead of spinning.
     reg("^chain/loop$", "chain_loop", "chain back to itself")
+
+    # Chains to a topic no rule handles, so gateway mode has a chained event to
+    # forward.
+    reg("^chain/orphan$", "chain_orphan", "chain to a topic no rule handles")
 }
 
 function chain_split(topic, payload,    f) {
@@ -42,4 +46,8 @@ function chain_numsrc(topic, payload) {
 
 function chain_loop(topic, payload) {
     chain("chain/loop", payload)
+}
+
+function chain_orphan(topic, payload) {
+    chain("chain/unmatched", payload)
 }
