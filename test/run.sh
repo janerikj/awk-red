@@ -603,6 +603,35 @@ case_pub_broker_fallback() {
     pass "$CASE"
 }
 
+# A failed publish keeps mosquitto_pub's own reason but attributes it: which
+# broker, and that it was a publish that failed. The run goes on regardless.
+case_pub_failure() {
+    CASE="a failed publish names the broker and keeps the run going"
+    local rc
+    printf 'gateway/loose hi\n' \
+        | PATH="$PWD/test/bin:$PATH" FAKE_PUB_MODE=fail \
+          MQTT_HOST=localhost MQTT_PORT=1883 MQTT_TLS=0 \
+          MQTT_PUB_HOST= MQTT_PUB_PORT= \
+          "$AWKRED" -q --gateway -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "a failed publish changed the exit status: $rc ($(cat "$ERR"))"
+    grep -qF 'Error: Connection refused' "$ERR" \
+        || bad "mosquitto_pub's own reason was lost: $(cat "$ERR")"
+    grep -qF "awk-red: error: publish to localhost:1883 failed: mosquitto_pub exited with status 1" "$ERR" \
+        || bad "no attributed publish error: $(cat "$ERR")"
+    grep -qF '(is the broker running?)' "$ERR" \
+        || bad "no hint that the broker may be down: $(cat "$ERR")"
+    printf 'gateway/loose hi\n' \
+        | PATH="$PWD/test/bin:$PATH" FAKE_PUB_MODE=ok \
+          MQTT_HOST=localhost MQTT_PORT=1883 MQTT_TLS=0 \
+          MQTT_PUB_HOST= MQTT_PUB_PORT= \
+          "$AWKRED" -q --gateway -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "a successful publish changed the exit status: $rc ($(cat "$ERR"))"
+    grep -qF 'error: publish' "$ERR" && bad "a successful publish was reported as failed: $(cat "$ERR")"
+    pass "$CASE"
+}
+
 # Gateway mode forwards a message no rule matched, unchanged, and never touches
 # one a rule handled - the rule owns it, so there is no double-publish.
 case_gateway_forwards() {
@@ -996,6 +1025,7 @@ cases=(
     case_split_recipe
     case_pub_broker_override
     case_pub_broker_fallback
+    case_pub_failure
     case_gateway_forwards
     case_gateway_chained
     case_gateway_empty_rules

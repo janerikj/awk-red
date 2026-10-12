@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.7.2-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.7.3-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -534,6 +534,9 @@ MQTT_PUB_HOST=out.example ./awk-red --gateway --mqtt -h in.example
 * **Chained events count too.** A `chain()` event that no rule matches is
   forwarded like an input message, through the same
   `json()`/`smooth()`/`limit()`/`changed()` pipeline.
+* **A failed forward is logged, not fatal.** If the publish broker cannot be
+  reached, `mosquitto_pub`'s reason is followed by an `awk-red: error: publish
+  to HOST:PORT failed ...` line and the run carries on (see *Troubleshooting*).
 
 ## HTTP webhooks
 
@@ -734,6 +737,18 @@ failed also warns and passes the raw payload through.
 without `--dry-run` and the commands fail - the exit status of `system()` is
 logged with `-v` - or you are running with `--dry-run`, in which case the
 `DRYRUN>` lines are the expected output.
+
+**A publish fails.** Under `--gateway` a broker that is down fails on every
+forwarded message, so awk-red adds a line naming the broker and the action, after
+`mosquitto_pub`'s own reason:
+
+```plain
+Error: Connection refused
+awk-red: error: publish to localhost:1883 failed: mosquitto_pub exited with status 1 (is the broker running?)
+```
+
+The run keeps going: a broker that is temporarily unreachable must not end the
+stream. `pub()` still returns the exit status, so a rule can react to it.
 
 **A rule throws a gawk error.** awk-red stops; that is deliberate, a broken
 rule should not silently swallow the stream. Run it against a recording to

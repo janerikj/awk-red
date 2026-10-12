@@ -15,6 +15,7 @@ failed` and the failing case named.
 | --- | --- |
 | `run.sh` | the suite: replay, opt-in inputs, clock, failure paths, signals, buffering, HTTP, smoothing, rate limits, chaining |
 | `fake-mosquitto-sub` | a stand-in subscriber whose behaviour comes from the environment |
+| `bin/mosquitto_pub` | a stand-in publisher: exits 1 with a connection error when `FAKE_PUB_MODE=fail` |
 | `rules/webhook.awk` | the rule the HTTP cases route through |
 | `rules/limit.awk` | the rule the rate-limit cases route through |
 | `rules/json.awk` | the rule the JSON extraction and the split recipe cases route through |
@@ -66,6 +67,14 @@ The fake keeps its connection open with one-second sleeps rather than one long
 sleep, and kills its own children from a trap: a killed child inherits the fifo
 descriptor, and a lingering sleep would keep the fifo open after the reader is
 gone.
+
+## The fake publisher
+
+awk-red calls `mosquitto_pub` by name, so `bin/mosquitto_pub` is put first on
+`PATH` for the publish cases. With `FAKE_PUB_MODE=fail` it prints mosquitto's
+own `Error: Connection refused` and exits 1, which is what lets a case check
+that awk-red attributes the failure to the broker and keeps the run going;
+otherwise it prints nothing and exits 0.
 
 ## HTTP
 

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# test/bin/mosquitto_pub - a stand-in for mosquitto_pub.
+#
+# Nothing is ever published: the suite is offline, and this exists so that the
+# failure path of pub() and pub_retained() can be produced on demand. awk-red
+# calls mosquitto_pub by name, so a case puts this directory first on PATH.
+#
+#   FAKE_PUB_MODE=fail   print mosquitto_pub's own connection error, exit 1
+#   FAKE_PUB_MODE=ok     publish nothing, exit 0 (the default)
+
+set -u
+
+if [[ ${FAKE_PUB_MODE:-ok} == fail ]]; then
+    printf 'Error: Connection refused\n' >&2
+    exit 1
+fi
+
+exit 0

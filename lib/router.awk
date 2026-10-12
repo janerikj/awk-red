@@ -69,16 +69,28 @@ function emit(cmd,    rc) {
     return rc
 }
 
+# Run one publish and, when it fails, add the one thing mosquitto_pub's own
+# "Error: ..." does not say: which broker it was talking to, and that the
+# failure is a publish. mosquitto_pub's line still reaches stderr first, so its
+# reason is not lost; this only attributes it. The run keeps going - a down
+# broker is not a reason to drop the stream - and the status is still returned.
+function publish(cmd,    rc) {
+    rc = emit(cmd)
+    if (rc != 0)
+        error("publish to " PUB_HOST ":" PUB_PORT " failed: mosquitto_pub exited with status " rc " (is the broker running?)")
+    return rc
+}
+
 # Publish an MQTT message. Connection details come from the configuration, so
 # rules never hardcode host, port or credentials:
 #     pub("alarm/temp", "hot")
 function pub(topic, payload) {
-    return emit(PUB_CMD " -t " shquote(topic) " -m " shquote(payload))
+    return publish(PUB_CMD " -t " shquote(topic) " -m " shquote(payload))
 }
 
 # Publish an MQTT message with a retained flag: pub_retained(topic, payload)
 function pub_retained(topic, payload) {
-    return emit(PUB_CMD " -r -t " shquote(topic) " -m " shquote(payload))
+    return publish(PUB_CMD " -r -t " shquote(topic) " -m " shquote(payload))
 }
 
 
