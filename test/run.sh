@@ -157,6 +157,55 @@ http_get() {
     return $rc
 }
 
+# POST with a body, same retry contract as http_get. The listener reads the
+# body by line, so the body must be newline-terminated to be accepted.
+http_post() {
+    local port=$1
+    local path=$2
+    local body=$3
+    local resp rc=1 attempt
+    for attempt in 1 2 3 4; do
+        resp=""
+        if { exec 3<>/dev/tcp/127.0.0.1/"$port"; } 2>/dev/null; then
+            printf 'POST %s HTTP/1.1\r\nHost: test\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+                "$path" "${#body}" "$body" >&3
+            resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
+            exec 3<&- 3>&-
+            printf '%s' "$resp" >"$WORK/httpresp"
+            if [[ $resp == *"200 OK"* ]]; then
+                rc=0
+                break
+            fi
+        fi
+        sleep 0.2
+    done
+    return $rc
+}
+
+# Send a raw request (request line + headers + body) for shapes http_get and
+# http_post cannot build, such as a hostile Content-Length. Returns 1 if no
+# response arrived.
+http_raw() {
+    local port=$1
+    local request=$2
+    local resp rc=1 attempt
+    for attempt in 1 2 3 4; do
+        resp=""
+        if { exec 3<>/dev/tcp/127.0.0.1/"$port"; } 2>/dev/null; then
+            printf '%s' "$request" >&3
+            resp=$(timeout 5 head -c 4096 <&3 2>/dev/null || true)
+            exec 3<&- 3>&-
+            printf '%s' "$resp" >"$WORK/httpresp"
+            if [[ -n $resp ]]; then
+                rc=0
+                break
+            fi
+        fi
+        sleep 0.2
+    done
+    return $rc
+}
+
 # -------------------------------------------------------------------- cases
 
 case_replay_golden() {
@@ -385,21 +434,120 @@ case_http_routes() {
     # An http-only run: -h is a broker setting, never an input of its own.
     start_awkred -n -v --webhook -P "$port" -r test/rules
     sleep 1.2
-    http_get "$port" "/hook/x?p=HOOKPAYLOAD"
+    http_get "$port" "/hook/x?m=HOOKPAYLOAD"
     rc=$?
     http_get "$port" "/hook/m?msg=MSGVAL"
     rc_msg=$?
-    http_get "$port" "/hook/prec?p=FIRST&msg=SECOND"
+    http_get "$port" "/hook/prec?m=FIRST&msg=SECOND"
     rc_prec=$?
+    # The client sees 200 before the listener has queued the engine line, so let
+    # the engine drain it before the run is stopped.
+    sleep 0.3
     finish_awkred TERM
-    (( rc == 0 )) || bad "http client did not get 200 OK (p=)"
+    (( rc == 0 )) || bad "http client did not get 200 OK (m=)"
     (( rc_msg == 0 )) || bad "http client did not get 200 OK (msg=)"
     (( rc_prec == 0 )) || bad "http client did not get 200 OK (precedence)"
     grep -qF "DRYRUN> echo hook 'HOOKPAYLOAD'" "$OUT" || bad "hook echo not found, got: $(cat "$OUT")"
     grep -qF "DRYRUN> echo hook 'MSGVAL'" "$OUT" || bad "msg= payload not routed, got: $(cat "$OUT")"
-    grep -qF "DRYRUN> echo hook 'FIRST'" "$OUT" || bad "p= should win over msg=, got: $(cat "$OUT")"
-    grep -qF "hook 'SECOND'" "$OUT" && bad "msg= payload used despite p= being present"
+    grep -qF "DRYRUN> echo hook 'FIRST'" "$OUT" || bad "m= should win over msg=, got: $(cat "$OUT")"
+    grep -qF "hook 'SECOND'" "$OUT" && bad "msg= payload used despite m= being present"
     grep -qF 'route get/hook/x' "$ERR" || bad "route not logged, stderr: $(cat "$ERR")"
+    assert_no_strays
+    pass "$CASE"
+}
+
+# A `topic=` override names the engine topic directly; one that would tear the
+# "topic payload" line (empty or with whitespace) is refused with 400.
+case_http_topic_override() {
+    CASE="a topic= override names the topic and a bad one gives 400"
+    local rc rc_empty rc_space port
+    port=$((22000 + RANDOM % 10000))
+    start_awkred -n -v --webhook -P "$port" -r test/rules
+    sleep 1.2
+    http_get "$port" "/hook/x?topic=custom/topic&m=OVERRIDE"
+    rc=$?
+    http_get "$port" "/hook/x?topic="
+    rc_empty=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "empty topic= should give 400, got: $(cat "$WORK/httpresp")"
+    http_get "$port" "/hook/x?topic=bad%20topic"
+    rc_space=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "whitespace topic= should give 400, got: $(cat "$WORK/httpresp")"
+    finish_awkred TERM
+    (( rc == 0 )) || bad "http client did not get 200 OK (topic override)"
+    (( rc_empty != 0 )) || bad "empty topic= should not give 200 OK"
+    (( rc_space != 0 )) || bad "whitespace topic= should not give 200 OK"
+    grep -qF "DRYRUN> echo custom 'OVERRIDE'" "$OUT" || bad "override topic not routed, got: $(cat "$OUT")"
+    grep -qF 'route custom/topic' "$ERR" || bad "override topic not logged, stderr: $(cat "$ERR")"
+    grep -qF 'route get/hook/x' "$ERR" && bad "derived topic routed despite override"
+    assert_no_strays
+    pass "$CASE"
+}
+
+# A request with no payload key and no body is refused, so a browser's automatic
+# /favicon.ico (or /) never becomes an event. An explicit empty key is allowed,
+# and a newline in a key or a multi-line body is refused rather than injected.
+case_http_no_payload() {
+    CASE="a payload-less request is refused; explicit empty and one-line body are fine"
+    local rc_none rc_fav rc_empty rc_nl rc_ml rc_body rc_body_nl port
+    port=$((23000 + RANDOM % 10000))
+    start_awkred -n -v --webhook -P "$port" -r test/rules
+    sleep 1.2
+    http_get "$port" "/hook/x"
+    rc_none=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "no payload should give 400, got: $(cat "$WORK/httpresp")"
+    http_get "$port" "/favicon.ico"
+    rc_fav=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "favicon should give 400, got: $(cat "$WORK/httpresp")"
+    http_get "$port" "/hook/e?m=a%0Ab"
+    rc_nl=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "newline in m= should give 400, got: $(cat "$WORK/httpresp")"
+    http_post "$port" "/hook/y" $'line1\nline2'
+    rc_ml=$?
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "multi-line body should give 400, got: $(cat "$WORK/httpresp")"
+    http_get "$port" "/hook/z?m="
+    rc_empty=$?
+    http_post "$port" "/hook/b" $'single line\n'
+    rc_body=$?
+    http_post "$port" "/hook/n" $'with nl\n'
+    rc_body_nl=$?
+    sleep 0.3
+    finish_awkred TERM
+    (( rc_none != 0 )) || bad "no payload should not give 200 OK"
+    (( rc_fav != 0 )) || bad "favicon should not give 200 OK"
+    (( rc_nl != 0 )) || bad "newline in m= should not give 200 OK"
+    (( rc_ml != 0 )) || bad "multi-line body should not give 200 OK"
+    (( rc_empty == 0 )) || bad "explicit empty m= should give 200 OK"
+    (( rc_body == 0 )) || bad "single-line body should give 200 OK"
+    (( rc_body_nl == 0 )) || bad "newline-terminated body should give 200 OK"
+    grep -qF "DRYRUN> echo hook ''" "$OUT" || bad "explicit empty payload not routed, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo hook 'single line'" "$OUT" || bad "single-line body not routed, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo hook 'with nl'" "$OUT" || bad "newline-terminated body terminator not stripped, got: $(cat "$OUT")"
+    grep -qF 'route get/favicon' "$ERR" && bad "favicon reached the engine"
+    assert_no_strays
+    pass "$CASE"
+}
+
+# A malformed or oversized Content-Length must be refused, not crash the
+# listener: only a plain integer length is usable, and an unreadable declared
+# body is a 400 rather than a hang or a silent empty payload.
+case_http_bad_content_length() {
+    CASE="a hostile Content-Length is refused without killing the listener"
+    local rc port
+    port=$((23000 + RANDOM % 10000))
+    start_awkred -n -v --webhook -P "$port" -r test/rules
+    sleep 1.2
+    http_raw "$port" $'POST /hook/big HTTP/1.1\r\nHost: t\r\nContent-Length: 999999999999\r\nConnection: close\r\n\r\n'
+    rc=$?
+    (( rc == 0 )) || bad "no response to an oversized Content-Length"
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "oversized Content-Length should give 400, got: $(cat "$WORK/httpresp")"
+    http_raw "$port" $'POST /hook/big HTTP/1.1\r\nHost: t\r\nContent-Length: 3.5\r\nConnection: close\r\n\r\n'
+    grep -qF '400 Bad Request' "$WORK/httpresp" || bad "fractional Content-Length should give 400, got: $(cat "$WORK/httpresp")"
+    http_get "$port" "/hook/x?m=ALIVE"
+    rc=$?
+    sleep 0.3
+    finish_awkred TERM
+    (( rc == 0 )) || bad "listener did not survive a hostile Content-Length"
+    grep -qF "DRYRUN> echo hook 'ALIVE'" "$OUT" || bad "request after the hostile one not routed, got: $(cat "$OUT")"
     assert_no_strays
     pass "$CASE"
 }
@@ -1039,6 +1187,9 @@ cases=(
     case_http_death
     case_http_off_by_default
     case_http_routes
+    case_http_topic_override
+    case_http_no_payload
+    case_http_bad_content_length
     case_http_port_taken
     case_http_deny
     case_http_sigterm

@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.7.3-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.8.0-red)
 
 > [!WARNING]
 > v0: The interface is subject to change!
@@ -551,9 +551,10 @@ A request becomes one line of engine input, exactly as any other source
 delivers one:
 
 ```text
-POST /door/front?p=open        ->  post/door/front open
-GET  /temp?p=21.5%20C          ->  get/temp 21.5 C
+POST /door/front?m=open        ->  post/door/front open
+GET  /temp?m=21.5%20C          ->  get/temp 21.5 C
 GET  /hook?msg=hello           ->  get/hook hello
+GET  /hook?topic=a/b&m=x       ->  a/b x
 GET  /Door/Front               ->  get/Door/Front
 POST /sensor   {"t":21}        ->  post/sensor {"t":21}
 ```
@@ -561,9 +562,22 @@ POST /sensor   {"t":21}        ->  post/sensor {"t":21}
 * The topic is the lowercased HTTP method plus the path with leading slashes
   stripped. Only the method is lowercased; the path is kept exactly as sent, so
   `GET /Door/Front` gives `get/Door/Front`.
-* The payload is the first of `p=`, `payload=` or `msg=` present in the query
-  string, urldecoded. If none is present, the request body is used as a single
-  line; a multi-line body is truncated at the first line.
+* A reserved `topic=` key overrides that derivation: its urldecoded value is
+  used verbatim as the topic (so the method prefix is gone). It is refused with
+  `400` if it is empty or contains whitespace, which would tear the
+  `"topic payload"` line.
+* The payload is the first of `m=`, `payload=` or `msg=` present in the query
+  string, urldecoded. If none is present, the request body is used instead. The
+  body must be a single newline-terminated line (note `curl --data-binary` does
+  not add one), and the declared length must match that one line. An empty
+  payload (a bare topic line) is allowed when a key is present with an empty
+  value, so a request can carry a payload-less event; that is different from
+  sending no payload at all.
+* A request with no recognised key and no body is refused with `400`, which is
+  what keeps a browser's automatic `GET /favicon.ico` (and `/`) off the broker. A
+  multi-line body, a body that never terminates, or a key whose value decodes to
+  CR or LF is also refused: the engine carries one message per line, so a newline
+  is a second event.
 * Every other query parameter is ignored.
 * One request per connection. It is answered `200 OK` or `400 Bad Request` and
   the connection is closed.
@@ -600,14 +614,19 @@ function hook_forward(topic, payload,    t) {
 }
 ```
 
-`POST /hook/front?p=open` arrives as `post/hook/front` with payload `open` and
+`POST /hook/front?m=open` arrives as `post/hook/front` with payload `open` and
 the rule publishes `events/hook/front` = `open`. To ignore the path entirely,
 build the topic from the payload or a constant instead: `pub("home/kitchen",
 payload)`.
 
-Only `p=`, `payload=` and `msg=` reach the rule, so a request cannot yet name
-its own topic; a `topic=` override is noted in `docs/design.md` as a possible
-future extension.
+A sender can also name the topic itself with `topic=`, so
+`GET /hook?topic=events/door&m=open` arrives as the topic `events/door` with
+payload `open` and needs no rule-side reshaping. Because the override is used
+verbatim, it drops the method prefix that otherwise namespaces webhooks - a rule
+that trusts `^post/` cannot rely on every `post/`-looking topic having come from
+an HTTP POST. The listener is unauthenticated and binds every interface, so a
+`topic=` override is another reason to firewall the webhook port; see
+`docs/design.md`.
 
 ## Buffering between stages
 

@@ -5,22 +5,36 @@
 # and sends a small HTTP response back to the client. One request per connection.
 #
 # Contract (minimal, as agreed):
-# - Topic: lowercase(method)/<path> where <path> has leading slashes removed
-# - Payload: the first of `p=`, `payload=` or `msg=` present in the query
-#   string, urldecoded. If none is present, the request body is used as a
-#   single line; a multi-line body is truncated at the first line read.
-# - Only `p=`, `payload=` and `msg=` query keys are honoured. Other query
-#   parameters are ignored. The key set is deliberately small: an alias is
+# - Topic: lowercase(method)/<path> where <path> has leading slashes removed.
+#   A `topic=` query key overrides that derivation: its urldecoded value is used
+#   verbatim as the topic. An override that is empty or contains whitespace is
+#   refused with 400 Bad Request, because a space would tear the "topic payload"
+#   line, and the derived topic is kept when the key is absent.
+# - Payload: an explicit `m=`, `payload=` or `msg=` query key (first match wins),
+#   urldecoded; otherwise the request body. A key always wins over the body. An
+#   empty value is allowed (`?m=`), a bare topic line, so a request can carry a
+#   payload-less event; retention and signals stay the rule's decision.
+# - A request with no key and no body is refused with 400: that is what keeps a
+#   browser's automatic `GET /favicon.ico` (and `/`) off the broker, especially
+#   in --gateway. A body spanning more than one line, or a key whose value
+#   decodes to CR or LF, is also refused - the engine carries one message per
+#   line, so a newline is a second event, not payload. A body must be one
+#   newline-terminated line; a declared but unreadable or multi-line body is
+#   refused the same way.
+# - Only `topic=`, `m=`, `payload=` and `msg=` query keys are honoured. Other
+#   query parameters are ignored. The key set is deliberately small: an alias is
 #   added when a real sender hardcodes it, not speculatively.
 # - Invalid percent-encodings are skipped / passed through as-is by this minimal
 #   decoder.
 #
 # Examples:
-#   POST /door/front?p=open  ->  post/door/front open
-#   GET  /temp?p=21.5%20C    ->  get/temp 21.5 C
-#   GET  /hook?msg=hello     ->  get/hook hello
-#   POST /sensor {"t":21}    ->  post/sensor {"t":21}
-#   DELETE /nopay            ->  delete/nopay (empty payload)
+#   POST /door/front?m=open   ->  post/door/front open
+#   GET  /temp?m=21.5%20C     ->  get/temp 21.5 C
+#   GET  /hook?msg=hello      ->  get/hook hello
+#   GET  /hook?topic=a/b&m=x  ->  a/b x
+#   GET  /hook?m=             ->  get/hook (explicit empty payload)
+#   POST /sensor {"t":21}     ->  post/sensor {"t":21}
+#   GET  /favicon.ico         ->  400, no line
 #
 # Limitations (gawk's /inet/tcp is not a real web server):
 # - One connection at a time. gawk closes the listening socket right after
@@ -113,28 +127,80 @@ BEGIN {
             if (tolower(h) ~ /^content-length:/) {
                 sub(/^[^:]+:[ \t]*/, "", h)
                 gsub(/^[ \t]+|[ \t]+$/, "", h)
-                content_len = h + 0
+                # Only a plain integer is a usable length; anything else would
+                # reach the ".{N}" body regexp and kill the listener, so it is
+                # treated as no body.
+                content_len = (h ~ /^[0-9]+$/) ? h + 0 : 0
             }
         }
 
-        # Recognised payload keys, first match wins (p, then payload, then msg).
-        # Kept deliberately small; form-encoded bodies are not decoded.
-        payload = ""
+        # A `topic=` override replaces the derived topic verbatim. It has to be
+        # a usable topic: an empty one, or one with whitespace, would tear the
+        # "topic payload" line, so it is refused instead of silently mangled.
+        bad = ""
         if (query != "") {
-            if (match(query, /(^|&)p=([^&]*)/, m)) {
-                payload = urldecode(m[2])
-            } else if (match(query, /(^|&)payload=([^&]*)/, m)) {
-                payload = urldecode(m[2])
-            } else if (match(query, /(^|&)msg=([^&]*)/, m)) {
-                payload = urldecode(m[2])
+            if (match(query, /(^|&)topic=([^&]*)/, args)) {
+                override = urldecode(args[2])
+                if (override == "" || override ~ /[[:space:]]/)
+                    bad = 1
+                else
+                    topic = override
             }
         }
 
-        if (payload == "" && content_len > 0) {
-            if ((service |& getline body) > 0) {
-                sub(/\r$/, "", body)
-                payload = body
+        # Recognised payload keys, first match wins (m, then payload, then msg).
+        # A key always wins over the body; an empty value is an explicit empty
+        # payload, not "no payload". Kept deliberately small; form-encoded
+        # bodies are not decoded.
+        payload = ""
+        have_payload = 0
+        if (query != "") {
+            if (match(query, /(^|&)m=([^&]*)/, args)) {
+                payload = urldecode(args[2])
+                have_payload = 1
+            } else if (match(query, /(^|&)payload=([^&]*)/, args)) {
+                payload = urldecode(args[2])
+                have_payload = 1
+            } else if (match(query, /(^|&)msg=([^&]*)/, args)) {
+                payload = urldecode(args[2])
+                have_payload = 1
             }
+        }
+
+        # A newline in a value is a second engine line, not payload: refuse it
+        # the same way a whitespace topic is refused.
+        if (have_payload && payload ~ /[\r\n]/)
+            bad = 1
+
+        # Otherwise a single-line body is the payload. gawk reads by RS, so the
+        # body must be one newline-terminated line; RT is the matched separator,
+        # which tells a real terminator from a read that merely timed out. On
+        # timeout gawk still hands back the bytes it has, so RT is the only
+        # reliable signal that the line really ended. Content-Length then says
+        # whether that one line was the whole body, otherwise it is refused
+        # rather than silently truncated.
+        if (!bad && !have_payload && content_len > 0) {
+            if ((service |& getline body) > 0 && RT == "\n") {
+                body_len = length(body)
+                sub(/\r$/, "", body)
+                if (content_len > body_len + 1)
+                    bad = 1
+                else {
+                    payload = body
+                    have_payload = 1
+                }
+            } else {
+                bad = 1
+            }
+        }
+
+        # No key and no body is not an event: it is what a browser's automatic
+        # /favicon.ico (and /) look like, so it must not reach the broker.
+        if (bad || !have_payload) {
+            resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nBad\n"
+            print resp |& service
+            close(service)
+            continue
         }
 
         resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nOK\n"

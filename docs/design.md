@@ -462,18 +462,53 @@ before the run starts, and someone could take it in between. The fatal bind
 message in `lib/http.awk` covers that window, so the worst case is a run that
 says why it has no listener, not one that silently never listens.
 
-One limit is worth naming because its obvious fix is not in the code. The
-request cannot choose the topic it becomes: the topic is always `method/path`,
-and of the query string only `p=`, `payload=` and `msg=` survive - every other
-key is dropped before a rule ever sees it. The payload aliases are held to that
-short list on purpose, one added only when a real sender hardcodes it, so the
-contract stays small enough to hold in your head. Reshaping the topic itself is
-left to the rule, with `sub()`, which is why there is no helper for it. If a
-webhook source should publish under a name of its own, the natural extension is
-a reserved `topic=` key the listener uses verbatim, keeping the derivation as
-the default. It is not built because no source has needed it yet and because it
-widens the contract further - once a request can name its own topic, `reg()`
-patterns have to assume topics that do not come from a URL.
+The query keys are held to a short list on purpose, one added only when a real
+sender hardcodes it, so the contract stays small enough to hold in your head.
+By default the topic is `method/path` and of the query string only `m=`,
+`payload=`, `msg=` and the reserved `topic=` survive - every other key is
+dropped before a rule ever sees it. `topic=` is the one key that changes how the
+event is addressed rather than what it carries: its urldecoded value replaces
+the derived topic verbatim, keeping the derivation as the default when the key
+is absent. It is refused with `400` when empty or when it contains whitespace,
+because the engine input is a `"topic payload"` line and a space in the topic
+would tear it into two fields.
+
+The override is a deliberate widening of the trust boundary. Without it a
+webhook topic always carries the method prefix, so a rule can namespace
+webhooks with `^post/` and know that nothing else can look like one. With it a
+request can name any topic at all, including internal `chain()` topics or MQTT
+topics a rule trusts, and the listener is unauthenticated and binds every
+interface. The key is kept for senders that cannot be changed to use the path;
+it is not a security feature, and a webhook port is still something to firewall
+rather than expose.
+
+That `m=` is the short payload key, not `p=`, matches `mosquitto_pub -m` and
+`git commit -m`: message. `p=` was dropped in v0.8.0 so the set reads as one
+family (topic/message), not a grab bag of first letters.
+
+A request that carries neither a payload key nor a body is refused with `400`
+rather than routed as an empty event. A browser fetching `/favicon.ico` (or `/`)
+is the common case, and under `--gateway` that empty event would be republished
+to the broker; an unauthenticated listener bound to every interface makes that
+amplification worth avoiding. An explicit empty value (`?m=`) is a different
+thing - a deliberate bare-topic line - and is allowed.
+
+The body path is where gawk's `/inet/tcp` shows through. gawk's `getline` reads
+a record per `RS`, and there is no fixed-length read, so the body is taken from
+one newline-terminated line and `Content-Length` only checks that the line was
+the whole body. A length-delimited body with no trailing newline - what a
+keep-alive `curl --data-binary` sends for JSON - never terminates, so the read
+returns nothing and the request is refused with `400` rather than routed with a
+silently empty payload; a body that spans more than one line is refused the same
+way. This is a real constraint, not a nicety: the engine carries one message per
+line, and gawk offers no better read to build on.
+
+`retained=` was considered alongside `topic=` and left out. Retained is a
+publish attribute, not an input one: a webhook is routed to rules and nothing
+is published unless a rule calls `pub()`, so retention is already the rule's
+decision through `pub_retained()`. A listener flag would also let an
+unauthenticated request plant persistent retained state, and the input line has
+no field to carry it without new framing for every source.
 
 ## Signals
 
@@ -785,8 +820,6 @@ Deliberately not built into the core:
 
 Roughly in order of value per effort:
 
-* **A `topic=` override for webhooks.** Let a request name the engine topic
-  instead of deriving it from the method and path; see *HTTP on the same fifo*.
 * **A `--watch` / `--follow` input.** File and directory changes, and `tail -F`
   of a log, as topics; `inotifywait` when present, polling otherwise.
 * **A UDP listener** (`--udp-port`) beside the HTTP one, for syslog, StatsD and
