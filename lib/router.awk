@@ -11,10 +11,14 @@
 #   * in-process chaining: chain() queues a message for another rule
 #   * diagnostics: log(), debug(), warn(), error()
 #
-# A rule file only registers a topic pattern and implements a handler:
+# A rule file only registers a topic filter and implements a handler:
 #
-#   BEGIN { reg("^home/door$", "door_handler", "notify on state change") }
+#   BEGIN { reg("home/door", "door_handler", "notify on state change") }
 #   function door_handler(topic, payload) { ... }
+#
+# reg(), json(), smooth(), limit() and changed() take an MQTT topic filter, with
+# + and # wildcards. The _re forms (reg_re(), ...) take a regular expression
+# instead, for the cases a filter cannot express.
 #
 # Do not run this file directly - use ./awk-red, which adds the rule files,
 # line-buffers both pipeline stages and passes the configuration.
@@ -96,24 +100,95 @@ function pub_retained(topic, payload) {
 
 # ----------------------------------------------------------------- dispatch
 
-# reg(pattern, handler, description)
-#
-# pattern is a regex matched against the topic. All matching rules run, in
-# registration order (registration order is the load order of the rule files).
-# Set AWKRED_FIRST_MATCH=1 to stop after the first match.
-function reg(pattern, handler, description) {
+# register_rule(pattern, handler, description) is the shared body of reg() and
+# reg_re(): it appends one row to the parallel dispatch arrays.
+function register_rule(pattern, handler, description) {
     N++
     ROUTE[N] = pattern
     HANDLER[N] = handler
     DESC[N] = description
-    debug("registered " pattern " -> " handler)
 }
 
-# JSON extraction. The first pattern that matches the topic decides how the
-# payload is normalised, so rules read plain text either way:
-#     json("^home/sensor/json$", ".temperature")
-# Patterns follow the same rules as reg().
-function json(pattern, jq_filter) {
+# reg(filter, handler, description)
+#
+# filter is an MQTT topic filter, wildcards and all, the way you would write it
+# for mosquitto_sub:
+#   +   one topic level        home/+/motion
+#   #   the rest of the topic  device/#
+# It is rewritten to an anchored regex once, here in BEGIN, so routing never
+# pays for the translation. All matching rules run, in registration order (which
+# is the load order of the rule files); AWKRED_FIRST_MATCH=1 stops after the
+# first. The original filter is kept only for --list-rules. For a pattern that a
+# filter cannot express, use reg_re().
+function reg(filter, handler, description,    re) {
+    re = mqtt2re(filter)
+    register_rule(re, handler, description)
+    ROUTE_MQTT[N] = filter
+    debug("reg " filter " -> " re)
+}
+
+# reg_re(pattern, handler, description) is reg() with a regex instead of an MQTT
+# filter: the advanced form for what + and # cannot express.
+function reg_re(pattern, handler, description) {
+    register_rule(pattern, handler, description)
+    debug("reg_re " pattern " -> " handler)
+}
+
+# Escape the ERE metacharacters in a literal MQTT topic level.
+function escape_re(s) {
+    gsub(/[][(){}*+?.^$|\\]/, "\\\\&", s)
+    return s
+}
+
+# mqtt2re(filter) rewrites an MQTT topic filter into an anchored ERE:
+#   +  -> [^/]+    exactly one (non-empty) topic level
+#   #  -> .*       the remaining levels, only valid as the last level
+# A trailing "/#" becomes "(/.*)?" so "home/#" also matches "home", the way a
+# broker would. Every other character is escaped literally, so a topic that
+# contains a regex metacharacter matches itself. A filter that still looks like
+# a regex (anchors, groups, alternation - the shape of an old reg() pattern)
+# warns, because it is almost certainly a pattern that has not been migrated.
+function mqtt2re(filter,    n, parts, i, re) {
+    if (filter ~ /[][^$()|\\]/)
+        warn("mqtt pattern " filter " looks like a regex; use the _re() form")
+    n = split(filter, parts, "/")
+    re = "^"
+    for (i = 1; i <= n; i++) {
+        if (parts[i] == "#" && i == n) {
+            re = re (n == 1 ? ".*" : "(/.*)?")
+            break
+        }
+        if (i > 1)
+            re = re "/"
+        if (parts[i] == "+")
+            re = re "[^/]+"
+        else {
+            if (parts[i] == "#")
+                warn("mqtt filter " filter ": '#' must be the last level, treated literally")
+            re = re escape_re(parts[i])
+        }
+    }
+    return re "$"
+}
+
+# json(filter, jq_filter)
+#
+# The first filter that matches the topic decides how the payload is
+# normalised, so rules read plain text either way:
+#     json("home/sensor/json", ".temperature")
+# The filter is an MQTT topic filter, like reg(). For a regex, use json_re().
+function json(filter, jq_filter,    re, before) {
+    re = mqtt2re(filter)
+    before = JN
+    json_re(re, jq_filter)
+    if (JN > before) {
+        JQ_MQTT[JN] = filter
+        debug("json " filter " -> " re)
+    }
+}
+
+# json_re(pattern, jq_filter) is json() with a regex instead of a filter.
+function json_re(pattern, jq_filter) {
     if (jq_filter ~ /'/)
         return warn("json filter " jq_filter " contains a quote, ignored")
     if (!have_jq())
@@ -122,7 +197,7 @@ function json(pattern, jq_filter) {
     JQ_PATTERN[JN] = pattern
     JQ_FILTER[JN] = jq_filter
     JQ_CMD[JN] = "jq -r --unbuffered " shquote(jq_filter) " 2>/dev/null"
-    debug("json " pattern " -> jq " jq_filter)
+    debug("json_re " pattern " -> jq " jq_filter)
 }
 
 # Coprocesses die fatally if the program cannot be started, so check once.
@@ -168,22 +243,33 @@ function adapt(topic, payload,    i, cmd, out, n) {
 
 # ------------------------------------------------------------- smoothing
 
-# smooth(pattern, factor) replaces every numeric payload on a matching topic
+# smooth(filter, factor) replaces every numeric payload on a matching topic
 # with an exponential moving average:
 #     new = factor * current + (1 - factor) * last
 # where last is the previous smoothed value, so one state value per topic
 # carries the whole history. The first message seeds the state and passes
-# through unchanged. Patterns follow the same rules as reg() and json():
-# first match wins, state is kept per exact topic. A factor outside (0..1]
-# warns and registers no smoothing, the way a bad window does.
-function smooth(pattern, factor) {
+# through unchanged. The filter is an MQTT topic filter; first match wins,
+# state is kept per exact topic. A factor outside (0..1] warns and registers no
+# smoothing, the way a bad window does. For a regex, use smooth_re().
+function smooth(filter, factor,    re, before) {
+    re = mqtt2re(filter)
+    before = SN
+    smooth_re(re, factor)
+    if (SN > before) {
+        SMOOTH_MQTT[SN] = filter
+        debug("smooth " filter " -> " re)
+    }
+}
+
+# smooth_re(pattern, factor) is smooth() with a regex instead of a filter.
+function smooth_re(pattern, factor) {
     if (factor !~ /^[+]?[0-9]*\.?[0-9]+$/ || factor + 0 <= 0 || factor + 0 > 1)
         return warn("smooth " pattern " needs a factor in (0..1], ignored")
     SN++
     SMOOTH_PATTERN[SN] = pattern
     SMOOTH_FACTOR[SN] = factor + 0
     SMOOTH_ARG[SN] = factor
-    debug("smooth " pattern " -> EMA " factor " per topic")
+    debug("smooth_re " pattern " -> EMA " factor " per topic")
 }
 
 # Run the payload through the registered smoother, if any. A payload that is
@@ -210,20 +296,31 @@ function smoothed(topic, payload,    i, v, key, last) {
 
 # ------------------------------------------------------------- rate limits
 
-# limit(pattern, seconds) allows at most one message per matching topic per
+# limit(filter, seconds) allows at most one message per matching topic per
 # window; every message inside the window is dropped after the payload is
-# normalised and smoothed but before any rule runs, so no handler sees it.
-# Patterns follow the same rules as reg() and json(): first match wins, and
-# the window is kept per exact topic, so a pattern over a prefix gives every
-# topic under it a window of its own. A bad window is a warning and no limit,
-# not a silent one-message-per-lifetime trap.
-function limit(pattern, seconds) {
+# normalised and smoothed but before any rule runs, so no handler sees it. The
+# filter is an MQTT topic filter; first match wins, and the window is kept per
+# exact topic, so a filter over a prefix gives every topic under it a window of
+# its own. A bad window is a warning and no limit, not a silent
+# one-message-per-lifetime trap. For a regex, use limit_re().
+function limit(filter, seconds,    re, before) {
+    re = mqtt2re(filter)
+    before = LN
+    limit_re(re, seconds)
+    if (LN > before) {
+        LIMIT_MQTT[LN] = filter
+        debug("limit " filter " -> " re)
+    }
+}
+
+# limit_re(pattern, seconds) is limit() with a regex instead of a filter.
+function limit_re(pattern, seconds) {
     if (seconds !~ /^[0-9]+$/ || seconds + 0 < 1)
         return warn("limit " pattern " needs whole seconds >= 1, ignored")
     LN++
     LIMIT_PATTERN[LN] = pattern
     LIMIT_SECONDS[LN] = seconds + 0
-    debug("limit " pattern " -> 1 per " seconds "s per topic")
+    debug("limit_re " pattern " -> 1 per " seconds "s per topic")
 }
 
 # The clock a limit window is measured against: systime(), whose one-second
@@ -259,17 +356,28 @@ function limited(topic,    i, key, now) {
 
 # ------------------------------------------------------------- dedup
 
-# changed(pattern) drops a matching topic's repeated payloads: a message only
+# changed(filter) drops a matching topic's repeated payloads: a message only
 # reaches the rules when its payload differs from the last one that did, so a
 # level that a sensor keeps republishing - or a poll that reads the same
 # register twice - is not an event. It is the level-to-edge conversion that
 # turns "same value again" into nothing, and it is per exact topic, just like
-# smooth() and limit(). Patterns follow the same rules as reg(): first match
-# wins.
-function changed(pattern) {
+# smooth() and limit(). The filter is an MQTT topic filter; first match wins.
+# For a regex, use changed_re().
+function changed(filter,    re, before) {
+    re = mqtt2re(filter)
+    before = CN
+    changed_re(re)
+    if (CN > before) {
+        CHANGED_MQTT[CN] = filter
+        debug("changed " filter " -> " re)
+    }
+}
+
+# changed_re(pattern) is changed() with a regex instead of a filter.
+function changed_re(pattern) {
     CN++
     CHANGED_PATTERN[CN] = pattern
-    debug("changed " pattern " -> drop repeated payloads per topic")
+    debug("changed_re " pattern " -> drop repeated payloads per topic")
 }
 
 # 1 when the payload repeats the last one seen on the topic, so the message is
@@ -407,16 +515,36 @@ function list_rules(    i) {
     printf "rules from %s\n\n", RULES_DIR
     if (N == 0 && JN == 0 && SN == 0 && LN == 0 && CN == 0)
         print "  (nothing registered)"
-    for (i = 1; i <= N; i++)
-        printf "  rule    %-22s %-18s %s\n", ROUTE[i], HANDLER[i], DESC[i]
-    for (i = 1; i <= JN; i++)
-        printf "  json    %-22s %-18s jq %s\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i]
-    for (i = 1; i <= SN; i++)
-        printf "  smooth  %-22s %-18s ema %s\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i]
-    for (i = 1; i <= LN; i++)
-        printf "  limit   %-22s %-18s 1 per %ds\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i]
-    for (i = 1; i <= CN; i++)
-        printf "  changed %-22s %-18s per topic\n", CHANGED_PATTERN[i], "(payload)"
+    for (i = 1; i <= N; i++) {
+        if (i in ROUTE_MQTT)
+            printf "  rule    %-22s %-18s %s  [mqtt %s]\n", ROUTE[i], HANDLER[i], DESC[i], ROUTE_MQTT[i]
+        else
+            printf "  rule    %-22s %-18s %s\n", ROUTE[i], HANDLER[i], DESC[i]
+    }
+    for (i = 1; i <= JN; i++) {
+        if (i in JQ_MQTT)
+            printf "  json    %-22s %-18s jq %s  [mqtt %s]\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i], JQ_MQTT[i]
+        else
+            printf "  json    %-22s %-18s jq %s\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i]
+    }
+    for (i = 1; i <= SN; i++) {
+        if (i in SMOOTH_MQTT)
+            printf "  smooth  %-22s %-18s ema %s  [mqtt %s]\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i], SMOOTH_MQTT[i]
+        else
+            printf "  smooth  %-22s %-18s ema %s\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i]
+    }
+    for (i = 1; i <= LN; i++) {
+        if (i in LIMIT_MQTT)
+            printf "  limit   %-22s %-18s 1 per %ds  [mqtt %s]\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i], LIMIT_MQTT[i]
+        else
+            printf "  limit   %-22s %-18s 1 per %ds\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i]
+    }
+    for (i = 1; i <= CN; i++) {
+        if (i in CHANGED_MQTT)
+            printf "  changed %-22s %-18s per topic  [mqtt %s]\n", CHANGED_PATTERN[i], "(payload)", CHANGED_MQTT[i]
+        else
+            printf "  changed %-22s %-18s per topic\n", CHANGED_PATTERN[i], "(payload)"
+    }
     printf "\n%d rule(s), %d json(s), %d smooth(s), %d limit(s), %d changed(s)\n", N, JN, SN, LN, CN
 }
 

@@ -12,3 +12,5 @@ DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -t 'alarm/temp/garden' -m 'hot: 3
 DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -r -t 'home/garden/temp_alarm' -m '1'
 DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -r -t 'home/door/state' -m 'open'
 DRYRUN> logger -t awk-red -p daemon.info 'door is now open'
+DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -t 'alarm/motion/hall' -m 'motion in hall'
+DRYRUN> mosquitto_pub -h 'localhost' -p '1883' -t 'device/log' -m 'device/garage/thermostat/state = 21.5'

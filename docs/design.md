@@ -82,10 +82,12 @@ running.
 ## Dispatch
 
 ```awk
-function reg(pattern, handler, description)
+function reg(filter, handler, description)
 ```
 
-Patterns are regexes matched against the topic. All matching rules run, in
+A filter is an MQTT topic filter rewritten to a regex once at registration (see
+*MQTT topic filters*); `reg_re()` takes the regex directly for what a filter
+cannot express. All matching rules run, in
 registration order; `--first-match` turns that into the first-match-wins
 semantics a switch node usually has.
 
@@ -104,6 +106,63 @@ fn = HANDLER[i]
 
 The `@` is required by gawk for a call through a variable, which is also why
 awk-red needs gawk and not mawk.
+
+## MQTT topic filters
+
+```awk
+function reg(filter, handler, description)
+function reg_re(pattern, handler, description)
+```
+
+`reg()` takes the filter you would hand to `mosquitto_sub` and rewrites it to a
+regex once, at registration - so the author writes `home/+/temp` instead of
+`^home/(.*)/temp$`. `reg_re()` is the regex form, for a pattern a filter cannot
+express. Every other stage (`json()`, `smooth()`, `limit()`, `changed()`) has
+the same two forms.
+
+| Filter level | Regex | Means |
+| --- | --- | --- |
+| `+` | `[^/]+` | exactly one, non-empty topic level |
+| `#` (last) | `.*` or `(/.*)?` | the rest of the topic |
+| anything else | escaped literally | itself, metacharacters included |
+
+The translation happens inside `reg()`, which `BEGIN` calls before the
+stream starts, and the result goes into the same `ROUTE` array `reg_re()`
+fills. Routing is therefore byte-for-byte the same work as a hand-written
+regex: the point is authoring, not speed. Four choices were made:
+
+* **Anchored.** A topic filter matches a whole topic, so the regex is `^...$`:
+  `home/+/temp` must not match `home/a/b/temp`.
+* **`+` needs a level.** `[^/]+` requires at least one character, so `sport/+`
+  does not match `sport/`. A broker would call the trailing slash an empty
+  level; treating it as a non-match is the strict reading and keeps `+` from
+  quietly matching an absent level.
+* **`home/#` includes `home`.** MQTT says a trailing `/#` also matches the
+  parent, so it becomes `(/.*)?` rather than `/.*`. Getting that wrong is the
+  classic off-by-one-level bug in hand-rolled filter translation.
+* **Escaped, not interpreted.** Everything that is not a wildcard is escaped,
+  so `device/v1.0/+` matches a literal dot. Without the escape, an MQTT author
+  who happens to write a regex metacharacter would silently match something
+  else.
+
+A `#` that is not the last level is invalid MQTT; it warns and is treated as a
+literal rather than quietly matching nothing. The default and the escape hatch
+are kept apart because they cannot share a name: a regex really does contain
+`+` and `#` as control characters, and a filter and a regex that both matched
+the topic would be two different things answering to one call. `_re()` is the
+opt-in regex, `--list-rules` prints the rewritten regex and the filter beside
+each other, and a filter that still looks like a regex - containing an anchor,
+a group, an alternation or a backslash - warns at start-up, because it is the
+shape of a pre-v0.9 pattern and will not match now:
+
+```plain
+  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [mqtt home/+/motion]
+```
+
+Every stage uses the same mechanism: `json()`, `smooth()`, `limit()` and
+`changed()` take a filter, their `_re()` forms take a regex, and the origin
+filters are kept in `*_MQTT` arrays printed by `--list-rules`. `mqtt2re()` is
+the single place to extend if the translation ever changes.
 
 ## Handlers get arguments, not `$0`
 
@@ -196,7 +255,7 @@ host without `jq` -> variant 2.
 
 ## Payload smoothing (built in v0.4.0)
 
-`smooth(pattern, factor)` replaces every numeric payload on a matching topic
+`smooth(filter, factor)` replaces every numeric payload on a matching topic
 with an exponential moving average, `new = factor * current + (1 - factor) *
 last`, state kept per exact topic. Five choices worth recording:
 
@@ -229,7 +288,7 @@ last`, state kept per exact topic. Five choices worth recording:
 
 ## Rate limiting (built in v0.4.0)
 
-`limit(pattern, seconds)` allows one message per matching topic per window and
+`limit(filter, seconds)` allows one message per matching topic per window and
 drops the rest. Two choices worth recording:
 
 * **Drop, not delay.** The message is discarded after the payload is
@@ -243,7 +302,7 @@ drops the rest. Two choices worth recording:
   pattern. Smoothing is unaffected: the average saw the message before the
   limiter did.
 * **First match, per exact topic** - the `json()` contract. The window is
-  keyed by pattern index and topic, so `^home/sensor/.*$` gives every sensor a
+  keyed by pattern index and topic, so `home/sensor/#` gives every sensor a
   window of its own and overlapping patterns never share state. A bad window
   warns and registers no limit, the way `json()` without `jq` does: fail
   open, never a silent one-message-per-lifetime trap.
@@ -259,7 +318,7 @@ than configuration, so it stays out of `.env.example`.
 
 ## Change detection (built in v0.6.0)
 
-`changed(pattern)` drops a matching topic's repeated payloads: a message is
+`changed(filter)` drops a matching topic's repeated payloads: a message is
 routed only when its payload differs from the last one that was. It is the
 level-to-edge conversion a republished sensor reading, or a re-read register,
 needs, and it is deliberately the same shape as `limit()`: first match wins,

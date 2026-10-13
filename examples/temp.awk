@@ -1,12 +1,12 @@
 # examples/temp.awk - temperature alarm with state
 #
-# A rule file registers a topic pattern and implements one handler. Nothing
+# A rule file registers a topic filter and implements one handler. Nothing
 # else: no configuration, no system() calls, no knowledge of the broker.
 #
-# Registered patterns are tried in load order, and every match runs.
+# Registered filters are tried in load order, and every match runs.
 
 BEGIN {
-    reg("^home/(.*)/temp$", "temp_handler", "alarm when a room gets too hot")
+    reg("home/+/temp", "temp_handler", "alarm when a room gets too hot")
 }
 
 # The handler gets the topic and the payload, not $0, so a payload with spaces

@@ -612,8 +612,41 @@ case_http_sigterm() {
 case_list_rules() {
     CASE="every example rule is discovered"
     "$AWKRED" -l -r examples >"$OUT" 2>&1 || bad "--list-rules exited $?"
-    grep -qF '^awk-red/tick(/|$)' "$OUT" || bad "no heartbeat rule listed"
-    grep -qF '7 rule(s), 2 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    grep -qF '^awk-red/tick(/.*)?$' "$OUT" || bad "no heartbeat rule listed"
+    grep -qF '9 rule(s), 2 json(s), 0 smooth(s), 0 limit(s)' "$OUT" || bad "unexpected rule count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The default reg() takes the MQTT filter itself: + is one level (and not zero
+# or two), # is the rest of the topic including the parent, and a literal dot
+# matches only a dot. The echoes make each match countable.
+case_mqtt_wildcards() {
+    CASE="the default reg() matches + and # the way a subscription does"
+    local rc
+    printf 'mqtt/room/temp 21\nmqtt/room/sub/temp 22\nmqtt/tree hi\nmqtt/tree/a/b yo\nmqtt/lit/v1.0/x 5\nmqtt/lit/v1x0/x 6\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo plus 'mqtt/room/temp=21'" "$OUT" \
+        || bad "+ did not match one level: $(cat "$OUT")"
+    grep -qF "mqtt/room/sub/temp" "$OUT" && bad "+ matched more than one level"
+    grep -qF "DRYRUN> echo hash 'mqtt/tree=hi'" "$OUT" \
+        || bad "# did not match the parent topic: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo hash 'mqtt/tree/a/b=yo'" "$OUT" \
+        || bad "# did not match a deeper topic: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo lit 'mqtt/lit/v1.0/x=5'" "$OUT" \
+        || bad "a literal dot did not match itself: $(cat "$OUT")"
+    grep -qF "mqtt/lit/v1x0/x" "$OUT" && bad "a literal dot matched a regex wildcard"
+    pass "$CASE"
+}
+
+# Both forms are visible: the generated regex is the pattern that matches, and
+# the original filter is kept beside it for the reader.
+case_mqtt_lists() {
+    CASE="an MQTT rule is listed with its filter and generated regex"
+    "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF '^mqtt/[^/]+/temp$' "$OUT" || bad "generated regex not listed: $(cat "$OUT")"
+    grep -qF '[mqtt mqtt/+/temp]' "$OUT" || bad "no mqtt filter annotation: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -656,16 +689,16 @@ case_limit_expiry() {
 case_limit_lists() {
     CASE="a registered limit is listed by --list-rules"
     "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
-    grep -qF 'limit   ^noise/' "$OUT" || bad "no limit row: $(cat "$OUT")"
-    grep -qF '2 limit(s)' "$OUT" || bad "summary has no limit count: $(cat "$OUT")"
+    grep -qF 'limit   ^noise(/.*)?$' "$OUT" || bad "no limit row: $(cat "$OUT")"
+    grep -qF '3 limit(s)' "$OUT" || bad "summary has no limit count: $(cat "$OUT")"
     pass "$CASE"
 }
 
 case_smooth_lists() {
     CASE="a registered smoother is listed by --list-rules"
     "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
-    grep -qF 'smooth  ^smooth/' "$OUT" || bad "no smooth row: $(cat "$OUT")"
-    grep -qF '2 smooth(s)' "$OUT" || bad "summary has no smooth count: $(cat "$OUT")"
+    grep -qF 'smooth  ^smooth(/.*)?$' "$OUT" || bad "no smooth row: $(cat "$OUT")"
+    grep -qF '3 smooth(s)' "$OUT" || bad "summary has no smooth count: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -1138,8 +1171,85 @@ case_changed_drop() {
 case_changed_lists() {
     CASE="a registered change detector is listed by --list-rules"
     "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
-    grep -qF 'changed ^edge/' "$OUT" || bad "no changed row: $(cat "$OUT")"
-    grep -qF '1 changed(s)' "$OUT" || bad "summary has no changed count: $(cat "$OUT")"
+    grep -qF 'changed ^edge(/.*)?$' "$OUT" || bad "no changed row: $(cat "$OUT")"
+    grep -qF '2 changed(s)' "$OUT" || bad "summary has no changed count: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# The _re() forms are the escape hatch for what + and # cannot express. A char
+# class and an alternation are ordinary regexes again here, not filters.
+case_regexp_matching() {
+    CASE="the _re() forms still match what + and # cannot express"
+    local rc
+    printf 're/a/two 1\nre/c/two 2\nre/ol/abc 3\nre/ol/ABC 4\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo alt 're/a/two=1'" "$OUT" \
+        || bad "an alternation branch did not match: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo alt 're/c/two=2'" "$OUT" \
+        && bad "a non-matched alternation branch routed"
+    grep -qF "DRYRUN> echo ol 're/ol/abc=3'" "$OUT" \
+        || bad "a char class did not match: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo ol 're/ol/ABC=4'" "$OUT" \
+        && bad "a char class matched outside its set"
+    pass "$CASE"
+}
+
+# Each stage has a _re form, and they behave exactly like the MQTT default:
+# the smoother moves, the limiter drops, the change detector turns levels into
+# edges. The edge and limit topics prove each _re stage keeps its own state.
+case_regexp_stages() {
+    CASE="the smooth/limit/changed _re() forms route like the MQTT forms"
+    local rc
+    printf 're/edge/7 on\nre/edge/7 on\nre/edge/7 off\nre/lim/1 1\nre/lim/1 2\nre/lim/2 1\nre/sm/5 5\nre/sm/5 7\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    [[ $(grep -c '^DRYRUN> echo red ' "$OUT") == 2 ]] \
+        || bad "expected 2 edges from 3 messages, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo red 're/edge/7=on'" "$OUT" \
+        || bad "the first _re edge was dropped: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo red 're/edge/7=off'" "$OUT" \
+        || bad "the second _re edge was dropped: $(cat "$OUT")"
+    [[ $(grep -c '^DRYRUN> echo rlm ' "$OUT") == 2 ]] \
+        || bad "expected 2 limited survivors, got: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo rlm 're/lim/2 1'" "$OUT" \
+        || bad "re/lim/2 does not have its own _re window: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo rsm 're/sm/5 5'" "$OUT" \
+        || bad "the _re smoother did not seed with the first value: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo rsm 're/sm/5 6'" "$OUT" \
+        || bad "the _re smoother did not move the average: $(cat "$OUT")"
+    pass "$CASE"
+}
+
+# json_re() extracts exactly like json().
+case_regexp_json() {
+    CASE="json_re() extracts like json()"
+    local rc
+    command -v jq >/dev/null 2>&1 || bad "jq is not installed"
+    printf 're/json/a {"value": 9}\nre/json/c {"value": 8}\n' \
+        | "$AWKRED" -n -q -r test/rules -i - >"$OUT" 2>"$ERR"
+    rc=$?
+    (( rc == 0 )) || bad "exit $rc, stderr: $(cat "$ERR")"
+    grep -qF "DRYRUN> echo rjs 're/json/a 9'" "$OUT" \
+        || bad "the extracted value was not routed: $(cat "$OUT")"
+    grep -qF "DRYRUN> echo rjs 're/json/c 8'" "$OUT" \
+        && bad "json_re matched a topic its alternation does not cover"
+    pass "$CASE"
+}
+
+# A _re registration is listed with the regex, and - unlike a filter - carries
+# no [mqtt ...] annotation beside it.
+case_regexp_lists() {
+    CASE="a _re rule is listed with its regex and no mqtt annotation"
+    local line
+    "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
+    grep -qF '^re/(a|b)/two$' "$OUT" || bad "no _re rule listed: $(cat "$OUT")"
+    line=$(grep -F '^re/(a|b)/two$' "$OUT")
+    [[ $line == *"[mqtt "* ]] && bad "a _re rule was annotated as MQTT: $line"
+    grep -qF '3 smooth(s)' "$OUT" || bad "summary has no 3 smooth(s): $(cat "$OUT")"
+    grep -qF '3 limit(s)' "$OUT" || bad "summary has no 3 limit(s): $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -1182,6 +1292,8 @@ cases=(
     case_chain_inprocess
     case_chain_pipeline
     case_chain_loop_guard
+    case_mqtt_wildcards
+    case_mqtt_lists
     case_smooth_after_json
     case_tick_only
     case_http_death
@@ -1202,6 +1314,10 @@ cases=(
     case_pipe_modbus_recipe
     case_changed_drop
     case_changed_lists
+    case_regexp_matching
+    case_regexp_stages
+    case_regexp_json
+    case_regexp_lists
 )
 
 printf 'awk-red test suite\n\n'

@@ -4,7 +4,7 @@
 # that subscribes to home/door gets the current value immediately.
 
 BEGIN {
-    reg("^home/door$", "door_handler", "publish every door state change")
+    reg("home/door", "door_handler", "publish every door state change")
 }
 
 function door_handler(topic, payload,    state) {

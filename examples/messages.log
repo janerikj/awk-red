@@ -10,3 +10,5 @@ home/garden/temp 33.9
 home/door open
 home/unknown/device no rule matches this topic
 home/attic/temp
+home/hall/motion on
+device/garage/thermostat/state 21.5

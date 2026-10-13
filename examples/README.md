@@ -20,6 +20,7 @@ starting point for your own.
 | `door.awk` | state changes, retained messages, `emit()` for an arbitrary command |
 | `json.awk` | a JSON topic extracted by `json()`, so the handler sees plain text |
 | `chain.awk` | one reading split into internal events with `chain()`, handled by other rules |
+| `mqtt.awk` | the MQTT topic filter (`+`, `#`) that `reg()` takes by default |
 | `heartbeat.awk` | scheduled work from the built-in clock, publishing a heartbeat topic |
 | `modbus.sh` | a `--pipe` poll: one register read per row of `modbus.map`, printed as topics |
 | `modbus.map` | the register map (`slave type addr count fmt topic`) the recipe reads |

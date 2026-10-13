@@ -1,7 +1,14 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.8.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.9.0-red)
+
+> awk-red is to MQTT what AWK is to text files
 
 > [!WARNING]
 > v0: The interface is subject to change!
+>
+> v0.9: `reg()`, `json()`, `smooth()`, `limit()` and `changed()` now take an
+> MQTT topic filter (`+`, `#`) instead of a regex. For a regex, use the `_re`
+> form: `reg_re()`, `json_re()`, `smooth_re()`, `limit_re()`, `changed_re()`. A
+> pattern that still looks like a regex is warned about at start-up.
 
 A Node-RED style event router built on a small AWK engine, with MQTT, HTTP, a
 clock, a command's stdout and recordings as the inputs.
@@ -93,8 +100,9 @@ To bridge with no rules at all, use gateway mode (see *Gateway mode*).
 ```
 awk-red              the application: .env, flags, dependencies, rule discovery,
                      line buffering, process supervision
-lib/router.awk       the engine: dispatch table, side effects, JSON extraction,
-                     smoothing, rate limits, change detection, chaining, logging
+lib/router.awk       the engine: dispatch table (regex and MQTT filters), side
+                     effects, JSON extraction, smoothing, rate limits, change
+                     detection, chaining, logging
 examples/            bundled rules, loaded only with -r examples
 docs/design.md       why it is built this way, and what was tried instead
 .env.example         every configuration variable with its default
@@ -211,13 +219,13 @@ forgotten `-r` fails loudly instead of silently discarding the stream.
 
 ## Writing a rule
 
-A rule file registers a topic pattern and implements the handler the engine
+A rule file registers a topic filter and implements the handler the engine
 calls. That is the whole contract:
 
 ```awk
 # rules/lights.awk
 BEGIN {
-    reg("^home/door$", "door_handler", "turn the light on when the door opens")
+    reg("home/door", "door_handler", "turn the light on when the door opens")
 }
 
 function door_handler(topic, payload) {
@@ -235,11 +243,16 @@ minute" or "only on a state change".
 
 | Call | Does |
 | --- | --- |
-| `reg(pattern, handler, description)` | register a rule; called from `BEGIN` |
-| `json(pattern, jq_filter)` | normalise a JSON payload before rules see it |
-| `smooth(pattern, factor)` | replace a numeric payload with a moving average before limits and rules |
-| `limit(pattern, seconds)` | drop matching messages to at most one per topic per window |
-| `changed(pattern)` | drop a matching topic's repeated payloads, so only a change is an event |
+| `reg(filter, handler, description)` | register a rule from an MQTT topic filter; called from `BEGIN` |
+| `reg_re(pattern, handler, description)` | the same, with a regex for what a filter cannot express |
+| `json(filter, jq_filter)` | normalise a JSON payload before rules see it |
+| `json_re(pattern, jq_filter)` | the same, with a regex |
+| `smooth(filter, factor)` | replace a numeric payload with a moving average before limits and rules |
+| `smooth_re(pattern, factor)` | the same, with a regex |
+| `limit(filter, seconds)` | drop matching messages to at most one per topic per window |
+| `limit_re(pattern, seconds)` | the same, with a regex |
+| `changed(filter)` | drop a matching topic's repeated payloads, so only a change is an event |
+| `changed_re(pattern)` | the same, with a regex |
 | `chain(topic, payload)` | queue an internal event for another rule, no broker involved |
 | `pub(topic, payload)` | publish an MQTT message, using the configured broker |
 | `pub_retained(topic, payload)` | the same, with the retained flag |
@@ -270,6 +283,41 @@ emit("ntfy publish alerts " shquote("Door opened"))
 
 # or trigger a webhook
 emit("curl -fsS " shquote("https://example.org/hook?msg=" url))
+```
+
+### MQTT topic filters
+
+`reg()`, `json()`, `smooth()`, `limit()` and `changed()` take the MQTT topic
+filter you would hand to `mosquitto_sub`, wildcards and all:
+
+| Filter | Matches |
+| --- | --- |
+| `home/+/temp` | `home/kitchen/temp`, but not `home/upstairs/kitchen/temp` |
+| `device/#` | `device`, `device/a`, `device/a/b/c` |
+| `home/livingroom/+/state` | one level in the middle, a literal one at the end |
+
+`+` matches exactly one topic level and `#` matches the rest of the topic,
+including the parent. The filter is rewritten to a regular expression once, at
+start-up, so matching costs the same as a hand-written regex. Anything that is
+not a wildcard is taken literally, so a topic containing `.` or `+` matches
+itself. `--list-rules` shows both the generated regex and the filter you wrote:
+
+```plain
+  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [mqtt home/+/motion]
+```
+
+`examples/mqtt.awk` is this in full.
+
+For a pattern a filter cannot express - "one or more levels", "any lowercase
+letter", an alternation - the `_re()` forms take a regular expression instead.
+A rule that still passes a regex to the default form is warned about at
+start-up, because a v0.8 pattern written for the old API will not match now:
+
+```awk
+BEGIN {
+    # four levels deep is ordinary; this needs a regex, so *_re().
+    reg_re("^tellqmtt/in/.+/temperature$", "probe_handler", "any probe")
+}
 ```
 
 ## Engine-wide stages
@@ -303,8 +351,8 @@ pipeline - but it never reaches the broker:
 
 # stage 1: fan a combined reading out into internal events
 BEGIN {
-    json("^home/reading$", "[.temperature, .humidity] | @tsv")
-    reg("^home/reading$", "reading_split", "chain each field to its own topic")
+    json("home/reading", "[.temperature, .humidity] | @tsv")
+    reg("home/reading", "reading_split", "chain each field to its own topic")
 }
 
 function reading_split(topic, payload,    f) {
@@ -314,7 +362,7 @@ function reading_split(topic, payload,    f) {
 }
 
 # stage 2: ordinary rules handle the chained events
-BEGIN { reg("^home/reading/temperature$", "reading_temp", "alert on chained temperature") }
+BEGIN { reg("home/reading/temperature", "reading_temp", "alert on chained temperature") }
 
 function reading_temp(topic, payload) {
     if (payload + 0 > 30)
@@ -322,7 +370,7 @@ function reading_temp(topic, payload) {
 }
 
 # home/reading/humidity needs a rule of its own, or the event is discarded
-BEGIN { reg("^home/reading/humidity$", "reading_humidity", "alert on chained humidity") }
+BEGIN { reg("home/reading/humidity", "reading_humidity", "alert on chained humidity") }
 
 function reading_humidity(topic, payload) {
     if (payload + 0 > 60)
@@ -360,8 +408,8 @@ extraction. A rule sees plain text either way:
 
 ```awk
 BEGIN {
-    json("^home/sensor/json$", ".temperature")      # JSON in
-    reg("^home/sensor/json$", "json_handler", "alarm from a JSON sensor")
+    json("home/sensor/json", ".temperature")      # JSON in
+    reg("home/sensor/json", "json_handler", "alarm from a JSON sensor")
 }
 
 function json_handler(topic, payload) {            # plain text out
@@ -388,8 +436,8 @@ from the handler:
 ```awk
 # rules/split.awk
 BEGIN {
-    json("^home/sensor/json$", "[.temperature, .humidity] | @tsv")
-    reg("^home/sensor/json$", "split_fields", "publish each field")
+    json("home/sensor/json", "[.temperature, .humidity] | @tsv")
+    reg("home/sensor/json", "split_fields", "publish each field")
 }
 
 function split_fields(topic, payload,    f) {
@@ -409,7 +457,7 @@ keeps.
 ## Smoothing
 
 A sensor that jitters - 21.4, 21.9, 21.2 - can be smoothed before any rule
-sees it. `smooth(pattern, factor)` replaces every numeric payload on a
+sees it. `smooth(filter, factor)` replaces every numeric payload on a
 matching topic with an exponential moving average:
 
 ```text
@@ -429,8 +477,8 @@ like every other publish:
 ```awk
 # rules/smoothed.awk
 BEGIN {
-    smooth("^home/temp$", 0.9)      # one average per topic
-    reg("^home/temp$", "temp_handler", "publish a calm temperature")
+    smooth("home/temp", 0.9)      # one average per topic
+    reg("home/temp", "temp_handler", "publish a calm temperature")
 }
 
 function temp_handler(topic, payload) {
@@ -438,8 +486,11 @@ function temp_handler(topic, payload) {
 }
 ```
 
-Anchor the pattern with `$`: otherwise the rule also matches the
-`home/temp/filtered` topic it just published, and loops.
+An exact filter stays exact, so `home/temp` does not also match the
+`home/temp/filtered` topic it just published; to cover a subtree, use a `#`:
+`home/temp/#` matches `home/temp`, `home/temp/filtered` and everything below.
+A `#` registered under the topic a rule publishes to loops, so keep a publisher
+narrower than its rule.
 
 The pipeline runs `json()` first (a JSON topic must yield the number before it
 can be averaged), smoothing next, the rate limiter next, and change detection
@@ -452,19 +503,19 @@ drag the average toward zero.
 ## Rate limiting
 
 A topic that publishes faster than a rule can react can be throttled before
-any rule runs. `limit(pattern, seconds)` allows at most one message per
+any rule runs. `limit(filter, seconds)` allows at most one message per
 matching topic per window; the rest are dropped by the engine - after the
 payload is normalised and smoothed, but before any handler is called:
 
 ```awk
 # rules/noisy.awk
 BEGIN {
-    limit("^home/sensor/.*$", 60)          # one message per sensor per minute
-    reg("^home/sensor/.*$", "sensor_handler", "act on a quiet sensor")
+    limit("home/sensor/#", 60)          # one message per sensor per minute
+    reg("home/sensor/#", "sensor_handler", "act on a quiet sensor")
 }
 ```
 
-The window is kept per exact topic, so a pattern over a prefix gives every
+The window is kept per exact topic, so a filter over a prefix gives every
 topic under it a window of its own. The first matching `limit()` wins, the
 same way the first matching `json()` does, and `--list-rules` shows what is
 limited. A dropped message is logged with `-v`. The limit is engine-wide, like
@@ -481,15 +532,15 @@ limit only where that trade is worth it.
 
 A sensor that keeps republishing the same reading, or a poll that reads the
 same register twice, is not producing events - it is producing the *same*
-event. `changed(pattern)` turns that level into an edge: a matching topic is
+event. `changed(filter)` turns that level into an edge: a matching topic is
 routed only when its payload differs from the last one that was routed, so a
 repeat is dropped before any handler sees it.
 
 ```awk
 # rules/door.awk
 BEGIN {
-    changed("^home/door$")                 # only when the door state changes
-    reg("^home/door$", "door_handler", "turn the light on when the door opens")
+    changed("home/door")                 # only when the door state changes
+    reg("home/door", "door_handler", "turn the light on when the door opens")
 }
 ```
 
@@ -588,7 +639,7 @@ run that can never answer.
 
 ```awk
 # rules/webhook.awk
-BEGIN { reg("^get/hook/", "hook_handler", "manual trigger") }
+BEGIN { reg("get/hook/#", "hook_handler", "manual trigger") }
 function hook_handler(topic, payload) { emit("echo got " shquote(payload)) }
 ```
 
@@ -604,7 +655,7 @@ an ordinary string operation. To drop the method prefix:
 ```awk
 # rules/webhook-mqtt.awk
 BEGIN {
-    reg("^post/hook/", "hook_forward", "republish webhooks under our own topic")
+    reg("post/hook/#", "hook_forward", "republish webhooks under our own topic")
 }
 
 function hook_forward(topic, payload,    t) {

@@ -12,7 +12,7 @@
 # concurrency, so nothing inside the router can fire while input is idle.
 
 BEGIN {
-    reg("^awk-red/tick(/|$)", "tick_handler", "heartbeat and scheduled work")
+    reg("awk-red/tick/#", "tick_handler", "heartbeat and scheduled work")
 }
 
 function tick_handler(topic, payload,    iso) {

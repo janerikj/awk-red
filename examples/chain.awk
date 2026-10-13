@@ -11,11 +11,11 @@
 # it has to leave the process.
 
 BEGIN {
-    json("^home/reading$", "[.temperature, .humidity] | @tsv")
-    reg("^home/reading$", "reading_split", "chain each field to its own topic")
+    json("home/reading", "[.temperature, .humidity] | @tsv")
+    reg("home/reading", "reading_split", "chain each field to its own topic")
 
-    reg("^home/reading/temperature$", "reading_temp", "alert on the chained temperature")
-    reg("^home/reading/humidity$", "reading_humidity", "alert on the chained humidity")
+    reg("home/reading/temperature", "reading_temp", "alert on the chained temperature")
+    reg("home/reading/humidity", "reading_humidity", "alert on the chained humidity")
 }
 
 function reading_split(topic, payload,    f) {

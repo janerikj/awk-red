@@ -12,8 +12,8 @@
 # the coprocess plumbing lives in the engine.
 
 BEGIN {
-    json("^home/sensor/json$", ".temperature")
-    reg("^home/sensor/json$", "json_handler", "alarm from a JSON sensor")
+    json("home/sensor/json", ".temperature")
+    reg("home/sensor/json", "json_handler", "alarm from a JSON sensor")
 }
 
 function json_handler(topic, payload,    temp) {
