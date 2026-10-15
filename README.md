@@ -1,4 +1,4 @@
-# awk-red ![Version](https://img.shields.io/badge/version-v0.9.0-red)
+# awk-red ![Version](https://img.shields.io/badge/version-v0.9.2-red)
 
 > awk-red is to MQTT what AWK is to text files
 
@@ -303,7 +303,7 @@ not a wildcard is taken literally, so a topic containing `.` or `+` matches
 itself. `--list-rules` shows both the generated regex and the filter you wrote:
 
 ```plain
-  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [mqtt home/+/motion]
+  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [home/+/motion]
 ```
 
 `examples/mqtt.awk` is this in full.

@@ -156,7 +156,7 @@ a group, an alternation or a backslash - warns at start-up, because it is the
 shape of a pre-v0.9 pattern and will not match now:
 
 ```plain
-  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [mqtt home/+/motion]
+  rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [home/+/motion]
 ```
 
 Every stage uses the same mechanism: `json()`, `smooth()`, `limit()` and

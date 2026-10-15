@@ -517,31 +517,31 @@ function list_rules(    i) {
         print "  (nothing registered)"
     for (i = 1; i <= N; i++) {
         if (i in ROUTE_MQTT)
-            printf "  rule    %-22s %-18s %s  [mqtt %s]\n", ROUTE[i], HANDLER[i], DESC[i], ROUTE_MQTT[i]
+            printf "  rule    %-22s %-18s %s  [%s]\n", ROUTE[i], HANDLER[i], DESC[i], ROUTE_MQTT[i]
         else
             printf "  rule    %-22s %-18s %s\n", ROUTE[i], HANDLER[i], DESC[i]
     }
     for (i = 1; i <= JN; i++) {
         if (i in JQ_MQTT)
-            printf "  json    %-22s %-18s jq %s  [mqtt %s]\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i], JQ_MQTT[i]
+            printf "  json    %-22s %-18s jq %s  [%s]\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i], JQ_MQTT[i]
         else
             printf "  json    %-22s %-18s jq %s\n", JQ_PATTERN[i], "(payload)", JQ_FILTER[i]
     }
     for (i = 1; i <= SN; i++) {
         if (i in SMOOTH_MQTT)
-            printf "  smooth  %-22s %-18s ema %s  [mqtt %s]\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i], SMOOTH_MQTT[i]
+            printf "  smooth  %-22s %-18s ema %s  [%s]\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i], SMOOTH_MQTT[i]
         else
             printf "  smooth  %-22s %-18s ema %s\n", SMOOTH_PATTERN[i], "(payload)", SMOOTH_ARG[i]
     }
     for (i = 1; i <= LN; i++) {
         if (i in LIMIT_MQTT)
-            printf "  limit   %-22s %-18s 1 per %ds  [mqtt %s]\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i], LIMIT_MQTT[i]
+            printf "  limit   %-22s %-18s 1 per %ds  [%s]\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i], LIMIT_MQTT[i]
         else
             printf "  limit   %-22s %-18s 1 per %ds\n", LIMIT_PATTERN[i], "(topic)", LIMIT_SECONDS[i]
     }
     for (i = 1; i <= CN; i++) {
         if (i in CHANGED_MQTT)
-            printf "  changed %-22s %-18s per topic  [mqtt %s]\n", CHANGED_PATTERN[i], "(payload)", CHANGED_MQTT[i]
+            printf "  changed %-22s %-18s per topic  [%s]\n", CHANGED_PATTERN[i], "(payload)", CHANGED_MQTT[i]
         else
             printf "  changed %-22s %-18s per topic\n", CHANGED_PATTERN[i], "(payload)"
     }

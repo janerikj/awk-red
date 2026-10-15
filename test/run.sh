@@ -646,7 +646,7 @@ case_mqtt_lists() {
     CASE="an MQTT rule is listed with its filter and generated regex"
     "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^mqtt/[^/]+/temp$' "$OUT" || bad "generated regex not listed: $(cat "$OUT")"
-    grep -qF '[mqtt mqtt/+/temp]' "$OUT" || bad "no mqtt filter annotation: $(cat "$OUT")"
+    grep -qF '[mqtt/+/temp]' "$OUT" || bad "no filter annotation: $(cat "$OUT")"
     pass "$CASE"
 }
 
@@ -1240,14 +1240,14 @@ case_regexp_json() {
 }
 
 # A _re registration is listed with the regex, and - unlike a filter - carries
-# no [mqtt ...] annotation beside it.
+# no [filter] annotation beside it.
 case_regexp_lists() {
     CASE="a _re rule is listed with its regex and no mqtt annotation"
     local line
     "$AWKRED" -l -r test/rules >"$OUT" 2>&1 || bad "--list-rules exited $?"
     grep -qF '^re/(a|b)/two$' "$OUT" || bad "no _re rule listed: $(cat "$OUT")"
     line=$(grep -F '^re/(a|b)/two$' "$OUT")
-    [[ $line == *"[mqtt "* ]] && bad "a _re rule was annotated as MQTT: $line"
+    [[ $line == *"["* ]] && bad "a _re rule was annotated as MQTT: $line"
     grep -qF '3 smooth(s)' "$OUT" || bad "summary has no 3 smooth(s): $(cat "$OUT")"
     grep -qF '3 limit(s)' "$OUT" || bad "summary has no 3 limit(s): $(cat "$OUT")"
     pass "$CASE"

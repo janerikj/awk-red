@@ -5,7 +5,7 @@
 # that exists, but they cannot say "one or more levels" or "only lowercase
 # letters". These registrations prove every _re() form matches an ERE exactly
 # like the old API did, and - because they skip the filter translation - that
-# they route without an [mqtt ...] annotation.
+# they route without a [filter] annotation.
 BEGIN {
     reg_re("^re/(a|b)/two$", "re_alt", "alternation is a regex, not a filter")
     reg_re("^re/ol/[a-z]+$", "re_ol", "a character class is a regex, not a filter")
