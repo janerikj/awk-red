@@ -875,6 +875,37 @@ Deliberately not built into the core:
   interleave, but each line is written atomically (below `PIPE_BUF`), so a line
   is never torn. That is the property that lets a source be a plain `printf`.
 
+## Candidate engine functions
+
+The engine API so far - `json()`, `smooth()`, `limit()`, `changed()` - earns
+its place because each one carries state engine-wide, or does something a
+handler cannot do cheaply. Further candidates have been considered and sorted
+into the same two piles.
+
+| Function | Verdict | Notes |
+| --- | --- | --- |
+| `filter(pattern, condition)` | Rules territory | A handler that calls `next()` does this in one line; a condition mini-language in the engine would be a second parser beside AWK. |
+| `map()` / `transform()` | Rules territory | Payload and topic reassignment is what handlers are for. |
+| `format(pattern, fmt)` | Rules territory | `sprintf()` in a handler; no engine-wide state is involved. |
+| `debounce(pattern, seconds)` | Maybe | Ignore a topic until it has been quiet for N seconds. Distinct from `limit()` (at most one per window) and `changed()` (exact payload equality): a flapping sensor fires once when it settles, where `limit()` would let through one arbitrary edge per window. |
+| `aggregate()` / `window()` | Maybe | Sliding-window min/max/avg/count over the last N samples, complementing `smooth()`'s exponential average, which cannot answer "what was the maximum this hour". |
+
+The two maybes share the constraints that shaped `limit()` and `changed()`,
+and both are droppable at arrival time: a message that arrives too soon is
+discarded, never delayed, so neither needs the timer AWK does not have (see
+*The clock lives in the shell*). Open questions before either is built:
+
+* **Debounce** needs "quiet for N seconds", keyed on time since the previous
+  matching message, not time since the window opened as `limit()` is. Stage
+  order matters: like `changed()`, it should run last, so only a message that
+  would have reached a rule updates the last-seen timestamp.
+* **Windowing** stores samples per topic, so memory grows with the window
+  count and with the number of matching topics. A window bounded by count is
+  simple; one bounded by time wants the tick line to expire old samples, or
+  the buffer only shrinks while messages arrive.
+* Both follow the usual registration contract: first match wins, state per
+  exact topic, a bad argument warns and registers nothing.
+
 ## Roadmap
 
 Roughly in order of value per effort:
@@ -893,6 +924,15 @@ Roughly in order of value per effort:
   with a local set; ordering already makes this well defined.
 * **Observability**: per-topic counters and status reporting on
   `awk-red/status`.
+* **A faster publish path.** `pub()` spawns one `mosquitto_pub` per message, so
+  every publish is a process plus a fresh TCP and MQTT session. Benchmarks
+  (`bench/`) put it at 11-13 ms per message - about 80/s - against the engine's
+  ~200k messages/s offline, so a rule that republishes is limited by process and
+  connection setup, not by awk. A long-lived `mosquitto_pub -l` coprocess, fed
+  one payload per line, keeps a single connection and turns each publish into a
+  write; the cost is coprocess lifetime, flow control and the EPIPE/restart
+  handling `json()` already shows the shape of. Worth it only when a rule
+  publishes on most messages, since the connection is now held open.
 * **External liveness**, if an outside system ever needs it: a systemd timer
   unit publishing on a topic of its own, `awk-red/external/heartbeat`, which
   never depends on awk-red being alive. Deliberately not a cron entry - cron

@@ -13,3 +13,6 @@
 
 # personal rules
 /rules/
+
+# benchmark scratch (payloads, recordings, per-run timings)
+/bench/tmp/
