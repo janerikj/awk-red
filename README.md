@@ -4,14 +4,9 @@
 
 > [!WARNING]
 > v0: The interface is subject to change!
->
-> v0.9: `reg()`, `json()`, `smooth()`, `limit()` and `changed()` now take an
-> MQTT topic filter (`+`, `#`) instead of a regex. For a regex, use the `_re`
-> form: `reg_re()`, `json_re()`, `smooth_re()`, `limit_re()`, `changed_re()`. A
-> pattern that still looks like a regex is warned about at start-up.
 
 A Node-RED style event router built on a small AWK engine, with MQTT, HTTP, a
-clock, a command's stdout and recordings as the inputs.
+clock or a command's stdout as the inputs.
 
 Node-RED is built on a handful of simple ideas:
 
@@ -28,25 +23,29 @@ that handles what AWK is bad at, and a small AWK engine that routes.
 
 Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
 a broker, `--webhook` serves HTTP webhooks, `--tick` adds a clock, `--pipe`
-runs a command, `-i` replays a recording. A run needs at least one of them;
-broker settings (`-h`, `MQTT_HOST`, ...) only configure connections and never
-switch an input on by themselves.
+runs a command, `-i` replays a recording. A run needs at least one of them.
 
-```
---mqtt       mosquitto_sub -v -t '#'   the MQTT subscription
---webhook    HTTP clients              webhooks
---tick       the clock                 a message every interval
---pipe CMD   any command's stdout      a poller or a feed
--i FILE      a recording               a fixed stream
+```mermaid
+flowchart TD
+    subgraph Inputs["Inputs"]
+        MQTT["<b>--mqtt</b><br/>mosquitto_sub -v -t '#'"]
+        WEBHOOK["<b>--webhook</b><br/>HTTP clients"]
+        PIPE["<b>--pipe</b> CMD<br/>any command's stdout"]
+        TICK["<b>--tick</b><br/>the clock"]
+        FILE["<b>-i</b> FILE<br/>a recording"]
+    end
 
-        every input writes one line per message:  "topic payload"
-                       |
-                       v
-gawk -f lib/router.awk -f <rules>/*.awk     the engine
-        |
-        +--> chain()  -> another rule      (in-process, no publish)
-        +--> pub()    -> mosquitto_pub    (new MQTT messages)
-        +--> emit()   -> any command      (logger, ntfy, curl, scripts)
+    MQTT & WEBHOOK & PIPE & TICK & FILE --> FORMAT["One line per message:<br/><i>topic payload</i>"]
+
+    FORMAT --> ENGINE["gawk -f lib/router.awk<br/>-f &lt;rules&gt;/*.awk<br/>the engine"]
+
+    ENGINE --> CHAIN["<b>chain()</b><br/>another rule<br/><i>in-process, no publish</i>"]
+    ENGINE --> PUB["<b>pub()</b><br/>mosquitto_pub<br/><i>new MQTT messages</i>"]
+    ENGINE --> EMIT["<b>emit()</b><br/>any command<br/><i>logger, ntfy, curl, scripts</i>"]
+
+    classDef input fill:#e8f0fe,stroke:#980101,color:#980101
+
+    class MQTT,WEBHOOK,PIPE,TICK,FILE,ENGINE,CHAIN,PUB,EMIT,FORMAT input
 ```
 
 The engine never changes when automations are added. A rule is a new file in
@@ -62,7 +61,6 @@ a rule directory, and nothing else.
 | `mosquitto_pub` | the MQTT publisher, only for `pub()` | `sudo apt install mosquitto-clients` |
 | `stdbuf`, `timeout` | line buffering and the HTTP preflight (coreutils) | usually already installed |
 | `jq` | only for `json()` payload extraction | `sudo apt install jq` |
-| `ntfy` | only if a rule emits ntfy notifications | <https://github.com/dschep/ntfy> |
 
 `mawk` is the default `awk` on Raspberry Pi OS and is **not** supported: awk-red
 calls `gawk` explicitly.
@@ -71,19 +69,15 @@ calls `gawk` explicitly.
 
 ```shell
 git clone <this repo> && cd awk-red
-cp .env.example .env                     # set MQTT_HOST if you use a broker
+cp .env.example .env                      # set MQTT_HOST if you use a broker
 ./awk-red -n -r examples -i examples/messages.log  # dry run, bundled rules
-./awk-red -l -r examples                 # what handles what
-./awk-red -n -r examples --tick 1        # the clock alone, no broker needed
+./awk-red -l -r examples                  # what handles what
+./awk-red -n -r examples --tick 1         # the clock alone, no broker needed
 ./awk-red -r ./rules --mqtt -h mqtt.local # live, with your own rules
 ```
 
-There is no default rule directory: without `-r` (or `AWKRED_RULES`) no rules
-are loaded, so a real input can never trip an example rule by accident. Because
-a rule-less run that neither forwards nor lists would just discard the stream,
-that state is refused: name rules with `-r`, or add `--gateway` to forward
-(`-l` is exempt, it only lists). To watch the bundled examples against a real
-broker:
+There is no default rule directory: use `-r` (or `AWKRED_RULES`). To watch the bundled 
+examples against a real broker:
 
 ```shell
 # terminal 1
@@ -300,7 +294,8 @@ filter you would hand to `mosquitto_sub`, wildcards and all:
 including the parent. The filter is rewritten to a regular expression once, at
 start-up, so matching costs the same as a hand-written regex. Anything that is
 not a wildcard is taken literally, so a topic containing `.` or `+` matches
-itself. `--list-rules` shows both the generated regex and the filter you wrote:
+itself. A filter that looks like a regex is warned about at start-up. 
+`--list-rules` shows both the generated regex and the filter you wrote:
 
 ```plain
   rule    ^home/[^/]+/motion$    motion_handler     motion in any single room  [home/+/motion]
@@ -309,9 +304,7 @@ itself. `--list-rules` shows both the generated regex and the filter you wrote:
 `examples/mqtt.awk` is this in full.
 
 For a pattern a filter cannot express - "one or more levels", "any lowercase
-letter", an alternation - the `_re()` forms take a regular expression instead.
-A rule that still passes a regex to the default form is warned about at
-start-up, because a v0.8 pattern written for the old API will not match now:
+letter", an alternation - the `_re()` forms take a regular expression instead:
 
 ```awk
 BEGIN {
@@ -344,7 +337,7 @@ is acting on a topic.
 Two rules are linked when a handler queues a new internal event with
 `chain(topic, payload)`. The queued event is routed right after the current
 message finishes, through the same `json()`/`smooth()`/`limit()`/`changed()`
-pipeline - but it never reaches the broker:
+pipeline - but it never leaves the application:
 
 ```awk
 # rules/chain.awk
@@ -408,11 +401,11 @@ extraction. A rule sees plain text either way:
 
 ```awk
 BEGIN {
-    json("home/sensor/json", ".temperature")      # JSON in
+    json("home/sensor/json", ".temperature")      # re-writes the JSON
     reg("home/sensor/json", "json_handler", "alarm from a JSON sensor")
 }
 
-function json_handler(topic, payload) {            # plain text out
+function json_handler(topic, payload) {           # payload is now plain text
     if (payload + 0 > 30)
         pub("alarm/sensor", "hot: " payload)
 }
@@ -422,9 +415,7 @@ function json_handler(topic, payload) {            # plain text out
 automation for a plain-text topic - the handler code is identical.
 
 A filter must yield exactly one line per message; the footguns, and when to
-parse nested JSON in AWK instead, are in `docs/design.md`. (`json()` was
-called `adapter()` until v0.4.0 - the rename is the one breaking change so
-far.)
+parse nested JSON in AWK instead, are in `docs/design.md`.
 
 ### Splitting one message into several topics
 
