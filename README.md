@@ -21,6 +21,8 @@ filters, the action body transforms and decides, and `system()` calls out to
 other programs. awk-red is that idea implemented as two files - a shell script
 that handles what AWK is bad at, and a small AWK engine that routes.
 
+Messages are routed by rules - a rule is a small AWK file that reacts to a topic.
+
 Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
 a broker, `--webhook` serves HTTP webhooks, `--tick SECONDS` injects a message
 on a fixed interval so rules run on a schedule, `--pipe` runs a command,
