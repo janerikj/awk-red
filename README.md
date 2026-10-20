@@ -31,16 +31,16 @@ on a fixed interval so rules run on a schedule, `--pipe` runs a command,
 ```mermaid
 flowchart TD
     subgraph Inputs["Inputs"]
-        MQTT["<b>--mqtt</b><br/>mosquitto_sub -v -t '#'"]
-        WEBHOOK["<b>--webhook</b><br/>HTTP clients"]
-        PIPE["<b>--pipe</b> CMD<br/>any command's stdout"]
-        TICK["<b>--tick</b> SECONDS<br/>the clock"]
-        FILE["<b>-i</b> FILE<br/>a recording"]
+        MQTT["<b>--mqtt</b><br/><i>mosquitto_sub -v -t '#'</i>"]
+        WEBHOOK["<b>--webhook</b><br/><i>HTTP clients</i>"]
+        PIPE["<b>--pipe</b> CMD<br/><i>any command's stdout</i>"]
+        TICK["<b>--tick</b> SECONDS<br/><i>the clock</i>"]
+        FILE["<b>-i</b> FILE<br/><i>a recording</i>"]
     end
 
     MQTT & WEBHOOK & PIPE & TICK & FILE --> FORMAT["<i>One line per message:</i><br/>'topic payload'"]
 
-    FORMAT --> ENGINE["gawk -f lib/router.awk<br/>-f &lt;rules&gt;/*.awk<br/>the engine"]
+    FORMAT --> ENGINE["gawk -f lib/router.awk<br/>-f &lt;rules&gt;/*.awk<br/><i>the engine</i>"]
 
     ENGINE --> CHAIN["<b>chain()</b><br/>another rule<br/><i>in-process, no publish</i>"]
     ENGINE --> PUB["<b>pub()</b><br/>mosquitto_pub<br/><i>new MQTT messages</i>"]
