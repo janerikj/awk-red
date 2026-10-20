@@ -22,8 +22,9 @@ other programs. awk-red is that idea implemented as two files - a shell script
 that handles what AWK is bad at, and a small AWK engine that routes.
 
 Inputs are opt-in and each one is asked for separately: `--mqtt` subscribes to
-a broker, `--webhook` serves HTTP webhooks, `--tick` adds a clock, `--pipe`
-runs a command, `-i` replays a recording. A run needs at least one of them.
+a broker, `--webhook` serves HTTP webhooks, `--tick SECONDS` injects a message
+on a fixed interval so rules run on a schedule, `--pipe` runs a command,
+`-i` replays a recording. A run needs at least one of them.
 
 ```mermaid
 flowchart TD
@@ -31,7 +32,7 @@ flowchart TD
         MQTT["<b>--mqtt</b><br/>mosquitto_sub -v -t '#'"]
         WEBHOOK["<b>--webhook</b><br/>HTTP clients"]
         PIPE["<b>--pipe</b> CMD<br/>any command's stdout"]
-        TICK["<b>--tick</b><br/>the clock"]
+        TICK["<b>--tick</b> SECONDS<br/>the clock"]
         FILE["<b>-i</b> FILE<br/>a recording"]
     end
 
@@ -126,7 +127,7 @@ never committed.
 | `MQTT_USER` / `MQTT_PASS` | empty | broker credentials, sent as `-u`/`-P` |
 | `MQTT_TLS` | `0` | `1` enables TLS on both the subscription and `pub()` |
 | `MQTT_CAFILE` | system CA bundle | CA bundle used when TLS is on |
-| `MQTT_CLIENT_ID` | empty | client id, useful in broker logs |
+| `MQTT_CLIENT_ID` | `awk-red` | client id, for correct re-connects |
 | `MQTT_TOPIC` | `#` | subscription filter (`-t`) |
 | `MQTT_PUB_HOST` / `MQTT_PUB_PORT` | `MQTT_HOST` / `MQTT_PORT` | publish broker, for bridging |
 | `MQTT_PUB_USER` / `MQTT_PUB_PASS` | `MQTT_USER` / `MQTT_PASS` | publish credentials |
@@ -814,6 +815,12 @@ stream. `pub()` still returns the exit status, so a rule can react to it.
 **A rule throws a gawk error.** awk-red stops; that is deliberate, a broken
 rule should not silently swallow the stream. Run it against a recording to
 reproduce: `./awk-red -n -r examples -i examples/messages.log`.
+
+**Webhooks answer on `localhost` but not from another host.** On WSL2 they
+never do: the distro sits behind a NAT, its `172.x` address is unreachable from
+the LAN and Windows forwards nothing to it. Reaching the port needs a
+`netsh interface portproxy` forwarder plus an inbound firewall rule, and the
+WSL IP changes on every restart.
 
 ## Tests
 
