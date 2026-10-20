@@ -38,7 +38,7 @@ flowchart TD
         FILE["<b>-i</b> FILE<br/>a recording"]
     end
 
-    MQTT & WEBHOOK & PIPE & TICK & FILE --> FORMAT["One line per message:<br/><i>topic payload</i>"]
+    MQTT & WEBHOOK & PIPE & TICK & FILE --> FORMAT["<i>One line per message:</i><br/>'topic payload'"]
 
     FORMAT --> ENGINE["gawk -f lib/router.awk<br/>-f &lt;rules&gt;/*.awk<br/>the engine"]
 
