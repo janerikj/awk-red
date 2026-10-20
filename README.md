@@ -43,7 +43,7 @@ flowchart TD
     ENGINE --> PUB["<b>pub()</b><br/>mosquitto_pub<br/><i>new MQTT messages</i>"]
     ENGINE --> EMIT["<b>emit()</b><br/>any command<br/><i>logger, ntfy, curl, scripts</i>"]
 
-    classDef input fill:#e8f0fe,stroke:#980101,color:#980101
+    classDef input fill:#f0f0f0,stroke:#980101,color:#980101
 
     class MQTT,WEBHOOK,PIPE,TICK,FILE,ENGINE,CHAIN,PUB,EMIT,FORMAT input
 ```
